@@ -3,29 +3,30 @@ import logging
 import discord
 from discord import app_commands
 from discord.ext import commands
+from dotenv import load_dotenv
+from datetime import datetime
 import aiohttp
 import aiosqlite
-from datetime import datetime
 
-# ---------------------- Environment ----------------------
+# Load environment variables
+load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_ID = os.getenv("OWNER_ID")
-
 if not TOKEN or not OWNER_ID:
-    raise RuntimeError("DISCORD_TOKEN or OWNER_ID not set in environment variables")
+    raise RuntimeError("DISCORD_TOKEN or OWNER_ID not set in .env")
 OWNER_ID = int(OWNER_ID)
 
-# ---------------------- Logging -------------------------
+# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tony_bot")
 
-# ---------------------- Intents ------------------------
+# Intents
 intents = discord.Intents.default()
 intents.guilds = True
 
 DB_PATH = "bot_data.db"
+GUILD_ID = 984999848791126096  # Your server ID for instant sync
 
-# ---------------------- Bot Class ----------------------
 class TonyBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="/", intents=intents)
@@ -36,8 +37,11 @@ class TonyBot(commands.Bot):
         self.session = aiohttp.ClientSession()
         self.db = await aiosqlite.connect(DB_PATH)
         await self._ensure_tables()
-        await self.tree.sync()
-        logger.info("Commands synced")
+
+        # Sync commands to your server instantly
+        guild = discord.Object(id=GUILD_ID)
+        await self.tree.sync(guild=guild)
+        logger.info("Commands synced to guild!")
 
     async def _ensure_tables(self):
         await self.db.execute("""
@@ -69,10 +73,9 @@ class TonyBot(commands.Bot):
 
 bot = TonyBot()
 
-# ---------------------- Roblox API URLs ----------------------
+# Roblox API
 ROBLOX_USERS = "https://users.roblox.com/v1/usernames/users"
 
-# ---------------------- Roblox Helpers ----------------------
 async def roblox_get_user(session, username):
     try:
         async with session.post(ROBLOX_USERS, json={"usernames": [username], "excludeBannedUsers": False}) as resp:
@@ -83,7 +86,6 @@ async def roblox_get_user(session, username):
         logger.exception("Failed Roblox user lookup")
     return None
 
-# ---------------------- DM Helper ----------------------
 async def send_to_owner(embed: discord.Embed):
     owner = await bot.fetch_user(OWNER_ID)
     if owner:
@@ -92,14 +94,11 @@ async def send_to_owner(embed: discord.Embed):
         except Exception:
             logger.exception("Failed to DM owner")
 
-# ---------------------- Events ----------------------
 @bot.event
 async def on_ready():
     logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
-# ---------------------- Commands ----------------------
-
-# /report
+# /report command
 @bot.tree.command(name="report", description="Send a bug report to the bot owner")
 @app_commands.describe(bug="Describe the bug")
 async def report(interaction: discord.Interaction, bug: str):
@@ -118,7 +117,7 @@ async def report(interaction: discord.Interaction, bug: str):
     await bot.db.commit()
     await send_to_owner(embed)
 
-# /suggest
+# /suggest command
 @bot.tree.command(name="suggest", description="Send a suggestion to the bot owner")
 @app_commands.describe(idea="Your suggestion")
 async def suggest(interaction: discord.Interaction, idea: str):
@@ -137,8 +136,8 @@ async def suggest(interaction: discord.Interaction, idea: str):
     await bot.db.commit()
     await send_to_owner(embed)
 
-# /profile simplified
-@bot.tree.command(name="profile", description="Get Roblox profile info")
+# /profile command — premium look
+@bot.tree.command(name="profile", description="View a Roblox user's profile")
 @app_commands.describe(username="Roblox username")
 async def profile(interaction: discord.Interaction, username: str):
     await interaction.response.defer(ephemeral=False)
@@ -150,33 +149,39 @@ async def profile(interaction: discord.Interaction, username: str):
     user_id = user.get("id")
     display_name = user.get("displayName") or username
     name = user.get("name")
+    profile_link = f"https://www.roblox.com/users/{user_id}/profile"
 
     embed = discord.Embed(
-        title=f"Roblox Profile — {display_name}",
-        color=discord.Color.blue()
+        title=f"{display_name} — Roblox Profile",
+        url=profile_link,
+        color=discord.Color.blue(),
+        description=f"Click [here]({profile_link}) to view the profile on Roblox!"
     )
-    embed.set_thumbnail(url=f"https://www.roblox.com/headshot-thumbnail/image?userId={user_id}&width=420&height=420&format=png")
+    embed.set_image(url=f"https://www.roblox.com/headshot-thumbnail/image?userId={user_id}&width=420&height=420&format=png")
     embed.add_field(name="Username", value=name, inline=True)
     embed.add_field(name="Display Name", value=display_name, inline=True)
     embed.add_field(name="User ID", value=str(user_id), inline=True)
-    embed.add_field(name="Profile Link", value=f"[Click Here](https://www.roblox.com/users/{user_id}/profile)", inline=False)
+    embed.set_footer(text=f"Requested by {interaction.user}", icon_url=interaction.user.display_avatar.url)
+    embed.timestamp = datetime.utcnow()
 
     await interaction.followup.send(embed=embed)
 
-# /help
+# /help command — premium style
 @bot.tree.command(name="help", description="Show all bot commands")
 async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(
         title="📖 Tony Studios Bot — Help",
-        description="Here are all available commands:",
+        description="Click commands to use them directly!",
         color=discord.Color.blurple(),
         timestamp=datetime.utcnow()
     )
-    embed.add_field(name="🐞 /report <bug>", value="Send a bug report to the bot owner (DM)", inline=False)
-    embed.add_field(name="💡 /suggest <idea>", value="Send a suggestion to the bot owner (DM)", inline=False)
-    embed.add_field(name="🕹️ /profile <username>", value="View Roblox profile with avatar and basic info", inline=False)
+    embed.add_field(name="🕹️ /profile <username>", value="View a Roblox user's profile with avatar & link", inline=False)
+    embed.add_field(name="🐞 /report <bug>", value="Send a bug report to the bot owner via DM", inline=False)
+    embed.add_field(name="💡 /suggest <idea>", value="Send a suggestion to the bot owner via DM", inline=False)
     embed.add_field(name="❓ /help", value="Show this help message", inline=False)
+    embed.set_footer(text=f"Requested by {interaction.user}", icon_url=interaction.user.display_avatar.url)
+
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# ---------------------- Run Bot ----------------------
+# Run the bot
 bot.run(TOKEN)
