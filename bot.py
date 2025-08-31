@@ -23,13 +23,14 @@ logger = logging.getLogger("tony_bot")
 # Intents
 intents = discord.Intents.default()
 intents.guilds = True
-intents.messages = True
-intents.members = True  # Needed to give roles
+intents.members = True  # needed for role management
+intents.messages = True  # needed for on_message
+intents.message_content = True  # privileged intent for message content
 
 DB_PATH = "bot_data.db"
-GUILD_ID = 984999848791126096  # Your server ID for instant sync
-COUNTING_CHANNEL_ID = 1398545401598050425  # #🔢︱counting channel
-FAILURE_ROLE_ID = 1210840031023988776  # Role to give on fail
+GUILD_ID = 984999848791126096
+COUNTING_CHANNEL_ID = 1398545401598050425
+FAILURE_ROLE_ID = 1210840031023988776
 
 class TonyBot(commands.Bot):
     def __init__(self):
@@ -192,7 +193,7 @@ async def help_command(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# on_message event with full counting game
+# Counting game
 @bot.event
 async def on_message(message):
     if message.author.bot:
@@ -231,7 +232,6 @@ async def on_message(message):
             await bot.db.execute("UPDATE counting SET last_number = 0 WHERE channel_id = ?", (message.channel.id,))
             await bot.db.commit()
             await message.add_reaction("❌")
-            # Announce who failed
             await message.channel.send(f"❌ {message.author.mention} failed the counting game! Say 0 to start counting again.")
 
             # Give failure role
@@ -256,4 +256,8 @@ async def on_message(message):
     await bot.process_commands(message)
 
 # Run the bot
-bot.run(TOKEN)
+try:
+    bot.run(TOKEN)
+except discord.errors.PrivilegedIntentsRequired as e:
+    logger.error("⚠️ Privileged Intents are missing! Go to Discord Developer Portal and enable Message Content Intent.")
+    raise e
