@@ -182,6 +182,25 @@ async def help_command(interaction: discord.Interaction):
     embed.set_footer(text=f"Requested by {interaction.user}", icon_url=interaction.user.display_avatar.url)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
+@bot.event
+async def on_message(message):
+    # Ignore messages from the bot itself
+    if message.author == bot.user:
+        return
+
+    # Check if the bot was mentioned
+    if bot.user in message.mentions:
+        try:
+            # React with the letters: Y, E, S
+            emojis = ["🇾", "🇪", "🇸"]
+            for emoji in emojis:
+                await message.add_reaction(emoji)
+        except Exception:
+            logger.exception("Failed to react to mention")
+
+    # Process commands normally
+    await bot.process_commands(message)
 
 # Run the bot
 bot.run(TOKEN)
+
