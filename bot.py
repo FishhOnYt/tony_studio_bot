@@ -199,40 +199,32 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    # Counting channel logic
     if message.channel.id == COUNTING_CHANNEL_ID:
         try:
             number = int(message.content.strip())
         except ValueError:
             return
 
+        # Fetch last number from DB
         async with bot.db.execute("SELECT last_number FROM counting WHERE channel_id = ?", (message.channel.id,)) as cursor:
             row = await cursor.fetchone()
-            last_number = row[0] if row else None
+            last_number = row[0] if row else 0  # default 0 if not started
 
-        # Start counting
-        if number == 0 and (last_number is None or last_number != 0):
-            await bot.db.execute("INSERT OR REPLACE INTO counting (channel_id, last_number) VALUES (?, ?)", (message.channel.id, 0))
-            await bot.db.commit()
-            await message.add_reaction("✅")
-            await message.channel.send("1")
-            return
-
-        if last_number is None:
-            await message.add_reaction("❌")
-            await message.channel.send("Say 0 to start counting!")
-            return
-
+        # Correct number
         if number == last_number + 1:
+            # Update DB
             await bot.db.execute("UPDATE counting SET last_number = ? WHERE channel_id = ?", (number, message.channel.id))
             await bot.db.commit()
+            # React check
             await message.add_reaction("✅")
+            # Bot sends next number
             await message.channel.send(str(number + 1))
         else:
+            # Wrong number → reset
             await bot.db.execute("UPDATE counting SET last_number = 0 WHERE channel_id = ?", (message.channel.id,))
             await bot.db.commit()
             await message.add_reaction("❌")
-            await message.channel.send(f"❌ {message.author.mention} failed the counting game! Say 0 to start counting again.")
+            await message.channel.send(f"❌ {message.author.mention} failed the counting game! Start again with 1.")
 
             # Give failure role
             guild = message.guild
@@ -247,8 +239,7 @@ async def on_message(message):
     # React if bot mentioned
     if bot.user in message.mentions:
         try:
-            emojis = ["🇾", "🇪", "🇸", "❓"]
-            for emoji in emojis:
+            for emoji in ["🇾", "🇪", "🇸", "❓"]:
                 await message.add_reaction(emoji)
         except Exception:
             logger.exception("Failed to react to mention")
@@ -261,3 +252,4 @@ try:
 except discord.errors.PrivilegedIntentsRequired as e:
     logger.error("⚠️ Privileged Intents are missing! Go to Discord Developer Portal and enable Message Content Intent.")
     raise e
+
