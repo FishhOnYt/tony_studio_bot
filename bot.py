@@ -23,9 +23,9 @@ logger = logging.getLogger("tony_bot")
 # Intents
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True  # needed for role management
-intents.messages = True  # needed for on_message
-intents.message_content = True  # privileged intent for message content
+intents.members = True          # needed for role management
+intents.messages = True         # needed for on_message
+intents.message_content = True  # privileged intent for reading message content
 
 DB_PATH = "bot_data.db"
 GUILD_ID = 984999848791126096
@@ -43,6 +43,7 @@ class TonyBot(commands.Bot):
         self.db = await aiosqlite.connect(DB_PATH)
         await self._ensure_tables()
 
+        # Sync commands to specific guild for instant availability
         guild = discord.Object(id=GUILD_ID)
         await self.tree.sync(guild=guild)
         logger.info("Commands synced to guild!")
@@ -146,7 +147,7 @@ async def suggest(interaction: discord.Interaction, idea: str):
     await bot.db.commit()
     await send_to_owner(embed)
 
-# /profile command
+# /profile command — Roblox lookup
 @bot.tree.command(name="profile", description="View a Roblox user's profile")
 @app_commands.describe(username="Roblox username")
 async def profile(interaction: discord.Interaction, username: str):
@@ -193,44 +194,89 @@ async def help_command(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# Counting game
+
+# -------------------------
+# Counting game logic
+# -------------------------
 @bot.event
 async def on_message(message):
+    # Ignore non-guild or bot messages
     if message.author.bot:
         return
 
+    # Only run counting logic in the specified channel
     if message.channel.id == COUNTING_CHANNEL_ID:
         try:
             number = int(message.content.strip())
         except ValueError:
+            # ignore non-integer messages
+            await bot.process_commands(message)
             return
 
-        # Fetch last number from DB
+        # Ensure a row exists for this channel (creates if missing)
+        await bot.db.execute("INSERT OR IGNORE INTO counting (channel_id, last_number) VALUES (?, ?)", (message.channel.id, 0))
+        await bot.db.commit()
+
+        # Fetch last_number
         async with bot.db.execute("SELECT last_number FROM counting WHERE channel_id = ?", (message.channel.id,)) as cursor:
             row = await cursor.fetchone()
-            last_number = row[0] if row else 0  # start at 0 if not set
+            last_number = row[0] if row else 0
 
-        # Correct number check
+        # If the user sent the expected next number (start at 1)
         if number == last_number + 1:
-            # Update DB
+            # Update DB with user's number
             await bot.db.execute("UPDATE counting SET last_number = ? WHERE channel_id = ?", (number, message.channel.id))
             await bot.db.commit()
-            # React to user
-            await message.add_reaction("✅")
-            
-            # Bot sends next number
-            bot_msg = await message.channel.send(str(number + 1))
-            # React to bot's own message
-            await bot_msg.add_reaction("✅")
+
+            # React to user's correct message
+            try:
+                await message.add_reaction("✅")
+            except Exception:
+                logger.exception("Couldn't react to user's message")
+
+            # Bot posts the next number
+            next_num = number + 1
+            try:
+                bot_msg = await message.channel.send(str(next_num))
+            except Exception:
+                logger.exception("Failed to send next number")
+                bot_msg = None
+
+            # If bot posted, record the bot's number as counted (so users should say next_num+1)
+            if bot_msg:
+                try:
+                    # react to the bot message
+                    await bot_msg.add_reaction("✅")
+                except Exception:
+                    logger.exception("Couldn't react to bot message")
+                # store bot's number as last_number
+                try:
+                    await bot.db.execute("UPDATE counting SET last_number = ? WHERE channel_id = ?", (next_num, message.channel.id))
+                    await bot.db.commit()
+                except Exception:
+                    logger.exception("Failed to update last_number to bot's number")
 
         else:
-            # Wrong number → reset
-            await bot.db.execute("UPDATE counting SET last_number = 0 WHERE channel_id = ?", (message.channel.id,))
-            await bot.db.commit()
-            await message.add_reaction("❌")
-            await message.channel.send(f"❌ {message.author.mention} failed the counting game! Start again with 1.")
+            # Wrong number: reset to 0, react, announce, give failure role
+            try:
+                await message.add_reaction("❌")
+            except Exception:
+                logger.exception("Couldn't react with ❌")
 
-            # Give failure role
+            # reset DB to 0 (so next correct start is 1)
+            try:
+                await bot.db.execute("UPDATE counting SET last_number = 0 WHERE channel_id = ?", (message.channel.id,))
+                await bot.db.commit()
+            except Exception:
+                logger.exception("Failed to reset counting in DB")
+
+            # announce who failed
+            try:
+                await message.channel.send(f"❌ {message.author.mention} failed the counting game! Start again with **1**.")
+            except Exception:
+                logger.exception("Failed to send failure announcement")
+
+            # give failure role if possible
             guild = message.guild
             if guild:
                 role = guild.get_role(FAILURE_ROLE_ID)
@@ -238,9 +284,9 @@ async def on_message(message):
                     try:
                         await message.author.add_roles(role, reason="Failed counting game")
                     except Exception:
-                        logger.exception(f"Failed to give role to {message.author}")
+                        logger.exception(f"Failed to give role {FAILURE_ROLE_ID} to {message.author}")
 
-    # React if bot mentioned
+    # React if bot mentioned (keeps previous behavior)
     if bot.user in message.mentions:
         try:
             for emoji in ["🇾", "🇪", "🇸", "❓"]:
@@ -248,13 +294,13 @@ async def on_message(message):
         except Exception:
             logger.exception("Failed to react to mention")
 
+    # allow commands to be processed as normal
     await bot.process_commands(message)
 
-# Run the bot
+
+# Run the bot with helpful error if privileged intents are missing
 try:
     bot.run(TOKEN)
-except discord.errors.PrivilegedIntentsRequired as e:
-    logger.error("⚠️ Privileged Intents are missing! Go to Discord Developer Portal and enable Message Content Intent.")
-    raise e
-
-
+except discord.errors.PrivilegedIntentsRequired:
+    logger.error("⚠️ Privileged Intents are missing! Enable 'Message Content Intent' (and 'Server Members Intent' if needed) in the Discord Developer Portal for your bot, then restart.")
+    raise
