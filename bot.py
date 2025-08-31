@@ -23,9 +23,11 @@ logger = logging.getLogger("tony_bot")
 # Intents
 intents = discord.Intents.default()
 intents.guilds = True
+intents.messages = True  # Needed for on_message event
 
 DB_PATH = "bot_data.db"
 GUILD_ID = 984999848791126096  # Your server ID for instant sync
+COUNTING_CHANNEL_ID = 1398545401598050425  # #🔢︱counting channel
 
 class TonyBot(commands.Bot):
     def __init__(self):
@@ -60,6 +62,12 @@ class TonyBot(commands.Bot):
                 username TEXT,
                 content TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS counting (
+                channel_id INTEGER PRIMARY KEY,
+                last_number INTEGER DEFAULT 0
             )
         """)
         await self.db.commit()
@@ -182,28 +190,53 @@ async def help_command(interaction: discord.Interaction):
     embed.set_footer(text=f"Requested by {interaction.user}", icon_url=interaction.user.display_avatar.url)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# on_message event
 @bot.event
 async def on_message(message):
-    # Ignore messages from the bot itself
-    if message.author == bot.user:
+    # Ignore messages from bots
+    if message.author.bot:
         return
 
-    # Check if the bot was mentioned
+    # Counting channel logic
+    if message.channel.id == COUNTING_CHANNEL_ID:
+        try:
+            number = int(message.content.strip())
+        except ValueError:
+            return  # ignore non-numbers
+
+        async with bot.db.execute("SELECT last_number FROM counting WHERE channel_id = ?", (message.channel.id,)) as cursor:
+            row = await cursor.fetchone()
+            last_number = row[0] if row else 0
+
+        if number == last_number + 1:
+            # Correct number, update DB
+            if row:
+                await bot.db.execute("UPDATE counting SET last_number = ? WHERE channel_id = ?", (number, message.channel.id))
+            else:
+                await bot.db.execute("INSERT INTO counting (channel_id, last_number) VALUES (?, ?)", (message.channel.id, number))
+            await bot.db.commit()
+
+            # Reply with next number
+            await message.channel.send(str(number + 1))
+        else:
+            # Optional: react ❌ for wrong numbers
+            try:
+                await message.add_reaction("❌")
+            except Exception:
+                logger.exception("Failed to react to wrong number")
+
+    # React if bot mentioned
     if bot.user in message.mentions:
         try:
-            # React with "Yes?" using regional indicators + question mark
             emojis = ["🇾", "🇪", "🇸", "❓"]
             for emoji in emojis:
                 await message.add_reaction(emoji)
         except Exception:
             logger.exception("Failed to react to mention")
 
-    # Process commands normally
+    # Process commands
     await bot.process_commands(message)
-
 
 # Run the bot
 bot.run(TOKEN)
-
-
-
