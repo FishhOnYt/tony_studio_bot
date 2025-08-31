@@ -5,15 +5,15 @@ from discord import app_commands
 from discord.ext import commands
 import aiohttp
 import aiosqlite
-from dotenv import load_dotenv
 from datetime import datetime
 
-# Load environment variables
-load_dotenv()
+# Load environment variables directly from Railway
 TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_ID = os.getenv("OWNER_ID")
+
 if not TOKEN or not OWNER_ID:
-    raise RuntimeError("DISCORD_TOKEN or OWNER_ID not set in .env")
+    raise RuntimeError("DISCORD_TOKEN or OWNER_ID not set in Railway Variables")
+
 OWNER_ID = int(OWNER_ID)
 
 # Logging
@@ -299,3 +299,4 @@ async def grouproles(interaction: discord.Interaction, group_id: int):
 
 # Run the bot
 bot.run(TOKEN)
+
