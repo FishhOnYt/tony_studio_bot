@@ -192,7 +192,7 @@ async def on_message(message):
     if bot.user in message.mentions:
         try:
             # React with the letters: Y, E, S
-            emojis = ["🇾", "🇪", "🇸"]
+            emojis = ["🇾", "🇪", "🇸", "?"]
             for emoji in emojis:
                 await message.add_reaction(emoji)
         except Exception:
@@ -203,4 +203,5 @@ async def on_message(message):
 
 # Run the bot
 bot.run(TOKEN)
+
 
