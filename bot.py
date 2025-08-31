@@ -208,17 +208,21 @@ async def on_message(message):
         # Fetch last number from DB
         async with bot.db.execute("SELECT last_number FROM counting WHERE channel_id = ?", (message.channel.id,)) as cursor:
             row = await cursor.fetchone()
-            last_number = row[0] if row else 0  # default 0 if not started
+            last_number = row[0] if row else 0  # start at 0 if not set
 
-        # Correct number
+        # Correct number check
         if number == last_number + 1:
             # Update DB
             await bot.db.execute("UPDATE counting SET last_number = ? WHERE channel_id = ?", (number, message.channel.id))
             await bot.db.commit()
-            # React check
+            # React to user
             await message.add_reaction("✅")
+            
             # Bot sends next number
-            await message.channel.send(str(number + 1))
+            bot_msg = await message.channel.send(str(number + 1))
+            # React to bot's own message
+            await bot_msg.add_reaction("✅")
+
         else:
             # Wrong number → reset
             await bot.db.execute("UPDATE counting SET last_number = 0 WHERE channel_id = ?", (message.channel.id,))
@@ -252,4 +256,5 @@ try:
 except discord.errors.PrivilegedIntentsRequired as e:
     logger.error("⚠️ Privileged Intents are missing! Go to Discord Developer Portal and enable Message Content Intent.")
     raise e
+
 
