@@ -71,8 +71,6 @@ bot = TonyBot()
 
 # ---------------------- Roblox API URLs ----------------------
 ROBLOX_USERS = "https://users.roblox.com/v1/usernames/users"
-ROBLOX_PRESENCE = "https://presence.roblox.com/v1/presence/users"
-ROBLOX_BADGES = "https://badges.roblox.com/v1/users/{}/badges?limit=100"
 
 # ---------------------- Roblox Helpers ----------------------
 async def roblox_get_user(session, username):
@@ -83,22 +81,6 @@ async def roblox_get_user(session, username):
                 return data["data"][0]
     except Exception:
         logger.exception("Failed Roblox user lookup")
-    return None
-
-async def roblox_get_presence(session, user_id):
-    try:
-        async with session.post(ROBLOX_PRESENCE, json={"userIds": [user_id]}) as resp:
-            return await resp.json()
-    except Exception:
-        logger.exception("Failed Roblox presence")
-    return None
-
-async def roblox_get_badges(session, user_id):
-    try:
-        async with session.get(ROBLOX_BADGES.format(user_id)) as resp:
-            return await resp.json()
-    except Exception:
-        logger.exception("Failed Roblox badges")
     return None
 
 # ---------------------- DM Helper ----------------------
@@ -155,8 +137,8 @@ async def suggest(interaction: discord.Interaction, idea: str):
     await bot.db.commit()
     await send_to_owner(embed)
 
-# /profile command with avatar + badge images
-@bot.tree.command(name="profile", description="Get Roblox profile info with avatar and badges")
+# /profile simplified
+@bot.tree.command(name="profile", description="Get Roblox profile info")
 @app_commands.describe(username="Roblox username")
 async def profile(interaction: discord.Interaction, username: str):
     await interaction.response.defer(ephemeral=False)
@@ -164,25 +146,11 @@ async def profile(interaction: discord.Interaction, username: str):
     if not user:
         await interaction.followup.send(f"❌ Could not find Roblox user `{username}`")
         return
+
     user_id = user.get("id")
     display_name = user.get("displayName") or username
     name = user.get("name")
 
-    # Presence
-    presence_data = await roblox_get_presence(bot.session, user_id)
-    online_text = "Unknown"
-    try:
-        if presence_data and presence_data.get("userPresences"):
-            up = presence_data["userPresences"][0]
-            online_text = "Online" if up.get("userPresenceType") != 0 else "Offline"
-    except Exception:
-        pass
-
-    # Badges
-    badges_data = await roblox_get_badges(bot.session, user_id)
-    badges = badges_data.get("data", []) if badges_data else []
-
-    # Main embed
     embed = discord.Embed(
         title=f"Roblox Profile — {display_name}",
         color=discord.Color.blue()
@@ -190,51 +158,8 @@ async def profile(interaction: discord.Interaction, username: str):
     embed.set_thumbnail(url=f"https://www.roblox.com/headshot-thumbnail/image?userId={user_id}&width=420&height=420&format=png")
     embed.add_field(name="Username", value=name, inline=True)
     embed.add_field(name="Display Name", value=display_name, inline=True)
-    embed.add_field(name="Presence", value=online_text, inline=True)
-    
-    # Badge images as separate fields
-    if badges:
-        for badge in badges[:10]:  # show first 10 badges
-            embed.add_field(
-                name=badge.get("name"),
-                value=f"[Badge Link](https://www.roblox.com/badges/{badge.get('id')})",
-                inline=True
-            )
-    
-    await interaction.followup.send(embed=embed)
-
-# /robloxinfo new command
-@bot.tree.command(name="robloxinfo", description="Quick overview of a Roblox user")
-@app_commands.describe(username="Roblox username")
-async def robloxinfo(interaction: discord.Interaction, username: str):
-    await interaction.response.defer(ephemeral=False)
-    user = await roblox_get_user(bot.session, username)
-    if not user:
-        await interaction.followup.send(f"❌ Could not find Roblox user `{username}`")
-        return
-
-    user_id = user.get("id")
-    display_name = user.get("displayName") or username
-    name = user.get("name")
-
-    presence_data = await roblox_get_presence(bot.session, user_id)
-    online_text = "Unknown"
-    try:
-        if presence_data and presence_data.get("userPresences"):
-            up = presence_data["userPresences"][0]
-            online_text = "Online" if up.get("userPresenceType") != 0 else "Offline"
-    except Exception:
-        pass
-
-    embed = discord.Embed(
-        title=f"{display_name} — Quick Info",
-        color=discord.Color.purple()
-    )
-    embed.set_thumbnail(url=f"https://www.roblox.com/headshot-thumbnail/image?userId={user_id}&width=420&height=420&format=png")
-    embed.add_field(name="Username", value=name, inline=True)
-    embed.add_field(name="Display Name", value=display_name, inline=True)
-    embed.add_field(name="Presence", value=online_text, inline=True)
-    embed.set_footer(text=f"User ID: {user_id}")
+    embed.add_field(name="User ID", value=str(user_id), inline=True)
+    embed.add_field(name="Profile Link", value=f"[Click Here](https://www.roblox.com/users/{user_id}/profile)", inline=False)
 
     await interaction.followup.send(embed=embed)
 
@@ -249,8 +174,7 @@ async def help_command(interaction: discord.Interaction):
     )
     embed.add_field(name="🐞 /report <bug>", value="Send a bug report to the bot owner (DM)", inline=False)
     embed.add_field(name="💡 /suggest <idea>", value="Send a suggestion to the bot owner (DM)", inline=False)
-    embed.add_field(name="🕹️ /profile <username>", value="View Roblox profile with avatar and badges", inline=False)
-    embed.add_field(name="📊 /robloxinfo <username>", value="Quick overview of a Roblox user", inline=False)
+    embed.add_field(name="🕹️ /profile <username>", value="View Roblox profile with avatar and basic info", inline=False)
     embed.add_field(name="❓ /help", value="Show this help message", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
