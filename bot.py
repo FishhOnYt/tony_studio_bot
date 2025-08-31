@@ -191,8 +191,8 @@ async def on_message(message):
     # Check if the bot was mentioned
     if bot.user in message.mentions:
         try:
-            # React with the letters: Y, E, S
-            emojis = ["🇾", "🇪", "🇸", "?"]
+            # React with "Yes?" using regional indicators + question mark
+            emojis = ["🇾", "🇪", "🇸", "❓"]
             for emoji in emojis:
                 await message.add_reaction(emoji)
         except Exception:
@@ -201,7 +201,9 @@ async def on_message(message):
     # Process commands normally
     await bot.process_commands(message)
 
+
 # Run the bot
 bot.run(TOKEN)
+
 
 
