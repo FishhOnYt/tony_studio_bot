@@ -23,11 +23,13 @@ logger = logging.getLogger("tony_bot")
 # Intents
 intents = discord.Intents.default()
 intents.guilds = True
-intents.messages = True  # Needed for on_message event
+intents.messages = True
+intents.members = True  # Needed to give roles
 
 DB_PATH = "bot_data.db"
 GUILD_ID = 984999848791126096  # Your server ID for instant sync
 COUNTING_CHANNEL_ID = 1398545401598050425  # #🔢︱counting channel
+FAILURE_ROLE_ID = 1210840031023988776  # Role to give on fail
 
 class TonyBot(commands.Bot):
     def __init__(self):
@@ -40,7 +42,6 @@ class TonyBot(commands.Bot):
         self.db = await aiosqlite.connect(DB_PATH)
         await self._ensure_tables()
 
-        # Sync commands to your server instantly
         guild = discord.Object(id=GUILD_ID)
         await self.tree.sync(guild=guild)
         logger.info("Commands synced to guild!")
@@ -144,7 +145,7 @@ async def suggest(interaction: discord.Interaction, idea: str):
     await bot.db.commit()
     await send_to_owner(embed)
 
-# /profile command — premium look
+# /profile command
 @bot.tree.command(name="profile", description="View a Roblox user's profile")
 @app_commands.describe(username="Roblox username")
 async def profile(interaction: discord.Interaction, username: str):
@@ -174,7 +175,7 @@ async def profile(interaction: discord.Interaction, username: str):
 
     await interaction.followup.send(embed=embed)
 
-# /help command — premium style
+# /help command
 @bot.tree.command(name="help", description="Show all bot commands")
 async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -191,10 +192,9 @@ async def help_command(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# on_message event with full counting system
+# on_message event with full counting game
 @bot.event
 async def on_message(message):
-    # Ignore messages from bots
     if message.author.bot:
         return
 
@@ -203,7 +203,7 @@ async def on_message(message):
         try:
             number = int(message.content.strip())
         except ValueError:
-            return  # ignore non-numbers
+            return
 
         async with bot.db.execute("SELECT last_number FROM counting WHERE channel_id = ?", (message.channel.id,)) as cursor:
             row = await cursor.fetchone()
@@ -217,24 +217,32 @@ async def on_message(message):
             await message.channel.send("1")
             return
 
-        # Must have started counting
         if last_number is None:
             await message.add_reaction("❌")
             await message.channel.send("Say 0 to start counting!")
             return
 
-        # Correct number
         if number == last_number + 1:
             await bot.db.execute("UPDATE counting SET last_number = ? WHERE channel_id = ?", (number, message.channel.id))
             await bot.db.commit()
             await message.add_reaction("✅")
             await message.channel.send(str(number + 1))
         else:
-            # Wrong number, reset
             await bot.db.execute("UPDATE counting SET last_number = 0 WHERE channel_id = ?", (message.channel.id,))
             await bot.db.commit()
             await message.add_reaction("❌")
-            await message.channel.send("❌ Wrong number! Say 0 to start counting again.")
+            # Announce who failed
+            await message.channel.send(f"❌ {message.author.mention} failed the counting game! Say 0 to start counting again.")
+
+            # Give failure role
+            guild = message.guild
+            if guild:
+                role = guild.get_role(FAILURE_ROLE_ID)
+                if role:
+                    try:
+                        await message.author.add_roles(role, reason="Failed counting game")
+                    except Exception:
+                        logger.exception(f"Failed to give role to {message.author}")
 
     # React if bot mentioned
     if bot.user in message.mentions:
@@ -245,7 +253,6 @@ async def on_message(message):
         except Exception:
             logger.exception("Failed to react to mention")
 
-    # Process commands
     await bot.process_commands(message)
 
 # Run the bot
