@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 from datetime import datetime
 import aiohttp
 import aiosqlite
+import asyncio
+import random
 
 # Load environment variables
 load_dotenv()
@@ -30,13 +32,23 @@ intents.message_content = True
 DB_PATH = "bot_data.db"
 GUILD_ID = 984999848791126096
 
-# Counting channels (multiple allowed)
-COUNTING_CHANNEL_IDS = [
-    1398545401598050425,  # old channel
-    1411772929720586401   # new channel
-]
-
+# Counting channels
+COUNTING_CHANNEL_IDS = [1398545401598050425, 1411772929720586401]
 FAILURE_ROLE_ID = 1210840031023988776
+
+# Bonus entries per role
+BONUS_ROLES = {
+    1411126451163365437: 1,
+    1412210602159378462: 2,
+    1412212184792043530: 3,
+    1412212463176388689: 4,
+    1412212683515887710: 5,
+    1412212741674106952: 6,
+    1412212961338069022: 8
+}
+
+# Track giveaways
+giveaways = {}
 
 class TonyBot(commands.Bot):
     def __init__(self):
@@ -112,7 +124,114 @@ async def send_to_owner(embed: discord.Embed):
 async def on_ready():
     logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
-# /report command
+# -------------------------
+# Giveaway Commands
+# -------------------------
+@bot.tree.command(name="giveaway_start", description="Start a giveaway")
+@app_commands.describe(prize="The prize for the giveaway", duration="Duration in seconds")
+async def giveaway_start(interaction: discord.Interaction, prize: str, duration: int):
+    if duration <= 0:
+        await interaction.response.send_message("❌ Duration must be greater than 0 seconds!", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🎉 Giveaway! 🎉",
+        description=f"Prize: **{prize}**\nReact with 🎉 to enter!\nEnds in {duration} seconds.",
+        color=discord.Color.gold(),
+        timestamp=datetime.utcnow()
+    )
+    embed.set_footer(text=f"Hosted by {interaction.user}", icon_url=interaction.user.display_avatar.url)
+
+    await interaction.response.send_message("✅ Giveaway started!", ephemeral=True)
+    msg = await interaction.channel.send(embed=embed)
+    await msg.add_reaction("🎉")
+
+    giveaways[msg.id] = {"prize": prize, "message": msg, "ended": False}
+
+    await asyncio.sleep(duration)
+    await end_giveaway(interaction.channel, msg.id)
+
+async def end_giveaway(channel, message_id):
+    if message_id not in giveaways or giveaways[message_id]["ended"]:
+        return
+
+    msg = await channel.fetch_message(message_id)
+    reaction = discord.utils.get(msg.reactions, emoji="🎉")
+    if not reaction:
+        await channel.send("❌ No one entered the giveaway!")
+        giveaways[message_id]["ended"] = True
+        return
+
+    users = await reaction.users().flatten()
+    users = [u for u in users if not u.bot]
+    if not users:
+        await channel.send("❌ No valid users entered!")
+        giveaways[message_id]["ended"] = True
+        return
+
+    weighted_entries = []
+    for user in users:
+        entries = 1
+        member = channel.guild.get_member(user.id)
+        if member:
+            for role_id, bonus in BONUS_ROLES.items():
+                if discord.utils.get(member.roles, id=role_id):
+                    entries += bonus
+        weighted_entries.extend([user] * entries)
+
+    winner = random.choice(weighted_entries)
+    await channel.send(f"🎉 Congratulations {winner.mention}! You won **{giveaways[message_id]['prize']}**!")
+    giveaways[message_id]["ended"] = True
+
+@bot.tree.command(name="giveaway_end", description="End an active giveaway")
+@app_commands.describe(message_id="The message ID of the giveaway to end")
+async def giveaway_end(interaction: discord.Interaction, message_id: str):
+    try:
+        message_id = int(message_id)
+    except ValueError:
+        await interaction.response.send_message("❌ Invalid message ID!", ephemeral=True)
+        return
+    await interaction.response.send_message("✅ Giveaway ending...", ephemeral=True)
+    await end_giveaway(interaction.channel, message_id)
+
+@bot.tree.command(name="giveaway_reroll", description="Reroll a giveaway winner")
+@app_commands.describe(message_id="The message ID of the giveaway to reroll")
+async def giveaway_reroll(interaction: discord.Interaction, message_id: str):
+    try:
+        message_id = int(message_id)
+    except ValueError:
+        await interaction.response.send_message("❌ Invalid message ID!", ephemeral=True)
+        return
+
+    if message_id not in giveaways or not giveaways[message_id]["ended"]:
+        await interaction.response.send_message("❌ Giveaway not found or hasn't ended!", ephemeral=True)
+        return
+
+    msg = await interaction.channel.fetch_message(message_id)
+    reaction = discord.utils.get(msg.reactions, emoji="🎉")
+    if not reaction:
+        await interaction.response.send_message("❌ No one entered the giveaway!", ephemeral=True)
+        return
+
+    users = await reaction.users().flatten()
+    users = [u for u in users if not u.bot]
+    weighted_entries = []
+    for user in users:
+        entries = 1
+        member = interaction.guild.get_member(user.id)
+        if member:
+            for role_id, bonus in BONUS_ROLES.items():
+                if discord.utils.get(member.roles, id=role_id):
+                    entries += bonus
+        weighted_entries.extend([user] * entries)
+
+    winner = random.choice(weighted_entries)
+    await interaction.response.send_message(f"🎉 New winner: {winner.mention}!", ephemeral=False)
+
+# -------------------------
+# Your existing commands
+# -------------------------
+# /report
 @bot.tree.command(name="report", description="Send a bug report to the bot owner")
 @app_commands.describe(bug="Describe the bug")
 async def report(interaction: discord.Interaction, bug: str):
@@ -124,14 +243,13 @@ async def report(interaction: discord.Interaction, bug: str):
     )
     embed.set_author(name=str(interaction.user), icon_url=interaction.user.display_avatar.url)
     embed.set_footer(text=f"User ID: {interaction.user.id}")
-    
     await interaction.response.send_message("✅ Your bug report was sent!", ephemeral=True)
     await bot.db.execute("INSERT INTO reports (user_id, username, content) VALUES (?, ?, ?)",
                          (interaction.user.id, str(interaction.user), bug))
     await bot.db.commit()
     await send_to_owner(embed)
 
-# /suggest command
+# /suggest
 @bot.tree.command(name="suggest", description="Send a suggestion to the bot owner")
 @app_commands.describe(idea="Your suggestion")
 async def suggest(interaction: discord.Interaction, idea: str):
@@ -143,14 +261,13 @@ async def suggest(interaction: discord.Interaction, idea: str):
     )
     embed.set_author(name=str(interaction.user), icon_url=interaction.user.display_avatar.url)
     embed.set_footer(text=f"User ID: {interaction.user.id}")
-    
     await interaction.response.send_message("✅ Your suggestion was sent!", ephemeral=True)
     await bot.db.execute("INSERT INTO suggestions (user_id, username, content) VALUES (?, ?, ?)",
                          (interaction.user.id, str(interaction.user), idea))
     await bot.db.commit()
     await send_to_owner(embed)
 
-# /profile command
+# /profile
 @bot.tree.command(name="profile", description="View a Roblox user's profile")
 @app_commands.describe(username="Roblox username")
 async def profile(interaction: discord.Interaction, username: str):
@@ -177,10 +294,9 @@ async def profile(interaction: discord.Interaction, username: str):
     embed.add_field(name="User ID", value=str(user_id), inline=True)
     embed.set_footer(text=f"Requested by {interaction.user}", icon_url=interaction.user.display_avatar.url)
     embed.timestamp = datetime.utcnow()
-
     await interaction.followup.send(embed=embed)
 
-# /help command
+# /help
 @bot.tree.command(name="help", description="Show all bot commands")
 async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -189,101 +305,56 @@ async def help_command(interaction: discord.Interaction):
         color=discord.Color.blurple(),
         timestamp=datetime.utcnow()
     )
-    embed.add_field(name="🕹️ /profile <username>", value="View a Roblox user's profile with avatar & link", inline=False)
-    embed.add_field(name="🐞 /report <bug>", value="Send a bug report to the bot owner via DM", inline=False)
-    embed.add_field(name="💡 /suggest <idea>", value="Send a suggestion to the bot owner via DM", inline=False)
-    embed.add_field(name="❓ /help", value="Show this help message", inline=False)
-    embed.set_footer(text=f"Requested by {interaction.user}", icon_url=interaction.user.display_avatar.url)
-
+    embed.add_field(name="🕹️ /profile", value="View a Roblox user's profile", inline=False)
+    embed.add_field(name="🐞 /report", value="Send a bug report", inline=False)
+    embed.add_field(name="💡 /suggest", value="Send a suggestion", inline=False)
+    embed.add_field(name="🎉 /giveaway_start", value="Start a giveaway", inline=False)
+    embed.add_field(name="🛑 /giveaway_end", value="End a giveaway", inline=False)
+    embed.add_field(name="🔄 /giveaway_reroll", value="Reroll a giveaway", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-
 # -------------------------
-# Counting game logic
+# Counting game
 # -------------------------
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
-
     if message.channel.id in COUNTING_CHANNEL_IDS:
         try:
             number = int(message.content.strip())
         except ValueError:
             await bot.process_commands(message)
             return
-
-        # Ensure channel record exists
         await bot.db.execute("INSERT OR IGNORE INTO counting (channel_id, last_number) VALUES (?, ?)", (message.channel.id, 0))
         await bot.db.commit()
-
-        # Get last number for this channel
         async with bot.db.execute("SELECT last_number FROM counting WHERE channel_id = ?", (message.channel.id,)) as cursor:
             row = await cursor.fetchone()
             last_number = row[0] if row else 0
-
         if number == last_number + 1:
             await bot.db.execute("UPDATE counting SET last_number = ? WHERE channel_id = ?", (number, message.channel.id))
             await bot.db.commit()
-            try:
-                await message.add_reaction("✅")
-            except Exception:
-                logger.exception("Couldn't react to user's message")
-
+            await message.add_reaction("✅")
             next_num = number + 1
-            try:
-                bot_msg = await message.channel.send(str(next_num))
-            except Exception:
-                logger.exception("Failed to send next number")
-                bot_msg = None
-
-            if bot_msg:
-                try:
-                    await bot_msg.add_reaction("✅")
-                except Exception:
-                    logger.exception("Couldn't react to bot message")
-                try:
-                    await bot.db.execute("UPDATE counting SET last_number = ? WHERE channel_id = ?", (next_num, message.channel.id))
-                    await bot.db.commit()
-                except Exception:
-                    logger.exception("Failed to update last_number to bot's number")
-
+            bot_msg = await message.channel.send(str(next_num))
+            await bot_msg.add_reaction("✅")
+            await bot.db.execute("UPDATE counting SET last_number = ? WHERE channel_id = ?", (next_num, message.channel.id))
+            await bot.db.commit()
         else:
-            try:
-                await message.add_reaction("❌")
-            except Exception:
-                logger.exception("Couldn't react with ❌")
-            try:
-                await bot.db.execute("UPDATE counting SET last_number = 0 WHERE channel_id = ?", (message.channel.id,))
-                await bot.db.commit()
-            except Exception:
-                logger.exception("Failed to reset counting in DB")
-            try:
-                await message.channel.send(f"❌ {message.author.mention} failed the counting game! Start again with **1**.")
-            except Exception:
-                logger.exception("Failed to send failure announcement")
-
-            guild = message.guild
-            if guild:
-                role = guild.get_role(FAILURE_ROLE_ID)
-                if role:
-                    try:
-                        await message.author.add_roles(role, reason="Failed counting game")
-                    except Exception:
-                        logger.exception(f"Failed to give role {FAILURE_ROLE_ID} to {message.author}")
-
+            await message.add_reaction("❌")
+            await bot.db.execute("UPDATE counting SET last_number = 0 WHERE channel_id = ?", (message.channel.id,))
+            await bot.db.commit()
+            await message.channel.send(f"❌ {message.author.mention} failed the counting game! Start again with **1**.")
+            role = message.guild.get_role(FAILURE_ROLE_ID)
+            if role:
+                await message.author.add_roles(role, reason="Failed counting game")
     if bot.user in message.mentions:
-        try:
-            for emoji in ["🇾", "🇪", "🇸", "❓"]:
-                await message.add_reaction(emoji)
-        except Exception:
-            logger.exception("Failed to react to mention")
-
+        for emoji in ["🇾", "🇪", "🇸", "❓"]:
+            await message.add_reaction(emoji)
     await bot.process_commands(message)
-
 
 try:
     bot.run(TOKEN)
 except discord.errors.PrivilegedIntentsRequired:
-    logger.error("⚠️ Privileged Intents are missing! Enable 'Message Content Intent' and 'Server Members Intent' in the Discord Developer Portal.")
+    logger.error("⚠️ Enable 'Message Content Intent' & 'Server Members Intent' in Discord Developer Portal.")
     raise
