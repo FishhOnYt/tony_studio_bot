@@ -23,13 +23,19 @@ logger = logging.getLogger("tony_bot")
 # Intents
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True          # needed for role management
-intents.messages = True         # needed for on_message
-intents.message_content = True  # privileged intent for reading message content
+intents.members = True
+intents.messages = True
+intents.message_content = True
 
 DB_PATH = "bot_data.db"
 GUILD_ID = 984999848791126096
-COUNTING_CHANNEL_ID = 1398545401598050425
+
+# Counting channels (multiple allowed)
+COUNTING_CHANNEL_IDS = [
+    1398545401598050425,  # old channel
+    1411772929720586401   # new channel
+]
+
 FAILURE_ROLE_ID = 1210840031023988776
 
 class TonyBot(commands.Bot):
@@ -42,8 +48,6 @@ class TonyBot(commands.Bot):
         self.session = aiohttp.ClientSession()
         self.db = await aiosqlite.connect(DB_PATH)
         await self._ensure_tables()
-
-        # Sync commands to specific guild for instant availability
         guild = discord.Object(id=GUILD_ID)
         await self.tree.sync(guild=guild)
         logger.info("Commands synced to guild!")
@@ -84,7 +88,6 @@ class TonyBot(commands.Bot):
 
 bot = TonyBot()
 
-# Roblox API
 ROBLOX_USERS = "https://users.roblox.com/v1/usernames/users"
 
 async def roblox_get_user(session, username):
@@ -147,7 +150,7 @@ async def suggest(interaction: discord.Interaction, idea: str):
     await bot.db.commit()
     await send_to_owner(embed)
 
-# /profile command — Roblox lookup
+# /profile command
 @bot.tree.command(name="profile", description="View a Roblox user's profile")
 @app_commands.describe(username="Roblox username")
 async def profile(interaction: discord.Interaction, username: str):
@@ -200,41 +203,33 @@ async def help_command(interaction: discord.Interaction):
 # -------------------------
 @bot.event
 async def on_message(message):
-    # Ignore non-guild or bot messages
     if message.author.bot:
         return
 
-    # Only run counting logic in the specified channel
-    if message.channel.id == COUNTING_CHANNEL_ID:
+    if message.channel.id in COUNTING_CHANNEL_IDS:
         try:
             number = int(message.content.strip())
         except ValueError:
-            # ignore non-integer messages
             await bot.process_commands(message)
             return
 
-        # Ensure a row exists for this channel (creates if missing)
+        # Ensure channel record exists
         await bot.db.execute("INSERT OR IGNORE INTO counting (channel_id, last_number) VALUES (?, ?)", (message.channel.id, 0))
         await bot.db.commit()
 
-        # Fetch last_number
+        # Get last number for this channel
         async with bot.db.execute("SELECT last_number FROM counting WHERE channel_id = ?", (message.channel.id,)) as cursor:
             row = await cursor.fetchone()
             last_number = row[0] if row else 0
 
-        # If the user sent the expected next number (start at 1)
         if number == last_number + 1:
-            # Update DB with user's number
             await bot.db.execute("UPDATE counting SET last_number = ? WHERE channel_id = ?", (number, message.channel.id))
             await bot.db.commit()
-
-            # React to user's correct message
             try:
                 await message.add_reaction("✅")
             except Exception:
                 logger.exception("Couldn't react to user's message")
 
-            # Bot posts the next number
             next_num = number + 1
             try:
                 bot_msg = await message.channel.send(str(next_num))
@@ -242,14 +237,11 @@ async def on_message(message):
                 logger.exception("Failed to send next number")
                 bot_msg = None
 
-            # If bot posted, record the bot's number as counted (so users should say next_num+1)
             if bot_msg:
                 try:
-                    # react to the bot message
                     await bot_msg.add_reaction("✅")
                 except Exception:
                     logger.exception("Couldn't react to bot message")
-                # store bot's number as last_number
                 try:
                     await bot.db.execute("UPDATE counting SET last_number = ? WHERE channel_id = ?", (next_num, message.channel.id))
                     await bot.db.commit()
@@ -257,26 +249,20 @@ async def on_message(message):
                     logger.exception("Failed to update last_number to bot's number")
 
         else:
-            # Wrong number: reset to 0, react, announce, give failure role
             try:
                 await message.add_reaction("❌")
             except Exception:
                 logger.exception("Couldn't react with ❌")
-
-            # reset DB to 0 (so next correct start is 1)
             try:
                 await bot.db.execute("UPDATE counting SET last_number = 0 WHERE channel_id = ?", (message.channel.id,))
                 await bot.db.commit()
             except Exception:
                 logger.exception("Failed to reset counting in DB")
-
-            # announce who failed
             try:
                 await message.channel.send(f"❌ {message.author.mention} failed the counting game! Start again with **1**.")
             except Exception:
                 logger.exception("Failed to send failure announcement")
 
-            # give failure role if possible
             guild = message.guild
             if guild:
                 role = guild.get_role(FAILURE_ROLE_ID)
@@ -286,7 +272,6 @@ async def on_message(message):
                     except Exception:
                         logger.exception(f"Failed to give role {FAILURE_ROLE_ID} to {message.author}")
 
-    # React if bot mentioned (keeps previous behavior)
     if bot.user in message.mentions:
         try:
             for emoji in ["🇾", "🇪", "🇸", "❓"]:
@@ -294,13 +279,11 @@ async def on_message(message):
         except Exception:
             logger.exception("Failed to react to mention")
 
-    # allow commands to be processed as normal
     await bot.process_commands(message)
 
 
-# Run the bot with helpful error if privileged intents are missing
 try:
     bot.run(TOKEN)
 except discord.errors.PrivilegedIntentsRequired:
-    logger.error("⚠️ Privileged Intents are missing! Enable 'Message Content Intent' (and 'Server Members Intent' if needed) in the Discord Developer Portal for your bot, then restart.")
+    logger.error("⚠️ Privileged Intents are missing! Enable 'Message Content Intent' and 'Server Members Intent' in the Discord Developer Portal.")
     raise
