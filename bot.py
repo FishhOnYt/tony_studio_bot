@@ -1,3 +1,4 @@
+# tony_bot.py
 import os
 import logging
 import re
@@ -10,7 +11,7 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import aiohttp
 import aiosqlite
-from typing import Optional
+from typing import Optional, Dict
 
 # -------------------------
 # Basic config
@@ -32,7 +33,7 @@ intents.messages = True
 intents.message_content = True
 
 DB_PATH = "bot_data.db"
-GUILD_ID = 984999848791126096
+GUILD_ID = 984999848791126096  # replace if needed
 
 # Counting channels (multiple allowed)
 COUNTING_CHANNEL_IDS = [1398545401598050425, 1411772929720586401]
@@ -50,7 +51,7 @@ BONUS_ROLES = {
 }
 
 # In-memory giveaways store: message_id -> giveaway data
-giveaways = {}
+giveaways: Dict[int, dict] = {}
 
 # -------------------------
 # Helpers
@@ -60,10 +61,13 @@ def parse_duration_to_seconds(s: str) -> Optional[int]:
     Accepts strings like '1d', '2h30m', '45m', '90s', '1h30m20s', or pure seconds '3600'.
     Returns seconds or None if invalid.
     """
-    s = s.strip().lower()
+    s = (s or "").strip().lower()
+    if not s:
+        return None
     if s.isdigit():
-        return int(s)
-    pattern = r'(?:(?P<days>\d+)\s*d)?\s*(?:(?P<hours>\d+)\s*h)?\s*(?:(?P<minutes>\d+)\s*m)?\s*(?:(?P<seconds>\d+)\s*s)?'
+        sec = int(s)
+        return sec if sec > 0 else None
+    pattern = r'^\s*(?:(?P<days>\d+)\s*d)?\s*(?:(?P<hours>\d+)\s*h)?\s*(?:(?P<minutes>\d+)\s*m)?\s*(?:(?P<seconds>\d+)\s*s)?\s*$'
     m = re.fullmatch(pattern, s)
     if not m:
         return None
@@ -73,20 +77,18 @@ def parse_duration_to_seconds(s: str) -> Optional[int]:
 
 async def fetch_reaction_users(reaction: discord.Reaction):
     users = []
-    # safe async iteration (works across discord.py versions)
+    # async iterator for compatibility
     async for u in reaction.users():
         users.append(u)
     return users
 
 def format_extra_entries_field(giveaway_extra_roles):
-    # show combined of default BONUS_ROLES + any custom per-giveaway extras
-    lines = []
     combined = BONUS_ROLES.copy()
     if giveaway_extra_roles:
         combined.update(giveaway_extra_roles)
-    for rid, bonus in combined.items():
-        lines.append(f"<@&{rid}>: +{bonus}")
-    return "\n".join(lines) if lines else "None"
+    if not combined:
+        return "None"
+    return "\n".join(f"<@&{rid}>: +{bonus}" for rid, bonus in combined.items())
 
 # -------------------------
 # Bot class
@@ -94,13 +96,18 @@ def format_extra_entries_field(giveaway_extra_roles):
 class TonyBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="/", intents=intents)
-        self.session: aiohttp.ClientSession = None
-        self.db: aiosqlite.Connection = None
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.db: Optional[aiosqlite.Connection] = None
 
     async def setup_hook(self):
+        # start session + db
         self.session = aiohttp.ClientSession()
         self.db = await aiosqlite.connect(DB_PATH)
         await self._ensure_tables()
+
+        # ensure giveaway command group is registered before syncing
+        self.tree.add_command(giveaway_group)
+        # sync commands to guild for instant availability
         guild = discord.Object(id=GUILD_ID)
         await self.tree.sync(guild=guild)
         logger.info("Commands synced to guild!")
@@ -166,9 +173,8 @@ async def on_ready():
     logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
 # -------------------------
-# Giveaway: /giveaway (single command with many options)
+# Giveaway Group & Commands
 # -------------------------
-# Only users with manage_guild can use it (start/end/reroll)
 giveaway_group = app_commands.Group(name="giveaway", description="Giveaway commands")
 
 @giveaway_group.command(name="start", description="Start a giveaway")
@@ -179,7 +185,7 @@ giveaway_group = app_commands.Group(name="giveaway", description="Giveaway comma
     channel="Channel to post giveaway in",
     host="Host (defaults to you)",
     required_role="Role required to enter (optional)",
-    extra_entries="Optional extra entries in format roleid:bonus,roleid:bonus (e.g. 123:2,456:5)"
+    extra_entries="Optional extra entries roleid:bonus,roleid:bonus (e.g. 123:2,456:5)"
 )
 async def giveaway_start(interaction: discord.Interaction,
                          duration: str,
@@ -189,9 +195,14 @@ async def giveaway_start(interaction: discord.Interaction,
                          host: Optional[discord.Member] = None,
                          required_role: Optional[discord.Role] = None,
                          extra_entries: Optional[str] = None):
-    # permissions
+    # only in guilds
+    if not interaction.guild:
+        await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
+        return
+
+    # permissions: only Manage Guild (server) can start giveaways
     if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message("❌ You need Manage Server permission to start giveaways.", ephemeral=True)
+        await interaction.response.send_message("❌ You need the **Manage Server** permission to start giveaways.", ephemeral=True)
         return
 
     seconds = parse_duration_to_seconds(duration)
@@ -207,10 +218,9 @@ async def giveaway_start(interaction: discord.Interaction,
     # parse extra_entries param into dict
     giveaway_extra_roles = {}
     if extra_entries:
-        # allow forms like "123:2,456:5" or "<@&123>:2"
         parts = [p.strip() for p in extra_entries.split(",") if p.strip()]
         for p in parts:
-            p_clean = p.replace("<@&", "").replace(">", "")
+            p_clean = p.replace("<@&", "").replace(">", "").strip()
             if ":" in p_clean:
                 rid_str, bonus_str = p_clean.split(":", 1)
                 try:
@@ -219,7 +229,7 @@ async def giveaway_start(interaction: discord.Interaction,
                     if bonus > 0:
                         giveaway_extra_roles[rid] = bonus
                 except Exception:
-                    continue
+                    logger.warning(f"Could not parse extra entry part: {p}")
 
     ends_at = datetime.utcnow() + timedelta(seconds=seconds)
     ends_str = ends_at.strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -235,12 +245,20 @@ async def giveaway_start(interaction: discord.Interaction,
     embed.add_field(name="Extra entries", value=format_extra_entries_field(giveaway_extra_roles), inline=False)
     embed.set_footer(text=f"Started by {interaction.user}", icon_url=interaction.user.display_avatar.url)
 
+    # respond to starter
     await interaction.response.send_message(f"✅ Giveaway posted in {channel.mention}", ephemeral=True)
-    gw_msg = await channel.send(embed=embed)
+
+    # create message in target channel
     try:
-        await gw_msg.add_reaction("🎉")
-    except Exception:
-        logger.exception("Couldn't add reaction to giveaway message")
+        gw_msg = await channel.send(embed=embed)
+        try:
+            await gw_msg.add_reaction("🎉")
+        except Exception:
+            logger.exception("Couldn't add 🎉 reaction to giveaway message.")
+    except Exception as e:
+        logger.exception("Failed to post giveaway message.")
+        await interaction.followup.send("❌ Failed to post giveaway in that channel. Check permissions.", ephemeral=True)
+        return
 
     # store giveaway info
     giveaways[gw_msg.id] = {
@@ -248,28 +266,26 @@ async def giveaway_start(interaction: discord.Interaction,
         "channel_id": channel.id,
         "host_id": host.id if host else None,
         "required_role_id": required_role.id if required_role else None,
-        "extra_roles": giveaway_extra_roles,  # per-giveaway extras
+        "extra_roles": giveaway_extra_roles,
         "winners": winners,
         "ends_at": ends_at,
-        "message": gw_msg,
+        "message_id": gw_msg.id,
         "ended": False,
         "task": None
     }
 
     # schedule end
-    async def _auto_end(msg_id, chan, delay):
+    async def _auto_end(msg_id, chan_id, delay):
         await asyncio.sleep(delay)
-        await end_giveaway(chan, msg_id)
-
-    task = asyncio.create_task(_auto_end(gw_msg.id, channel, seconds))
+        chan = bot.get_channel(chan_id) or await bot.fetch_channel(chan_id)
+        if chan:
+            await end_giveaway(chan, msg_id)
+    task = asyncio.create_task(_auto_end(gw_msg.id, channel.id, seconds))
     giveaways[gw_msg.id]["task"] = task
 
-# end helper
 async def end_giveaway(channel: discord.TextChannel, message_id: int):
-    if message_id not in giveaways:
-        return
-    gw = giveaways[message_id]
-    if gw["ended"]:
+    gw = giveaways.get(message_id)
+    if not gw or gw.get("ended"):
         return
 
     try:
@@ -319,27 +335,29 @@ async def end_giveaway(channel: discord.TextChannel, message_id: int):
         return
 
     winners = []
-    chosen_members = set()
-    max_winners = min(gw["winners"], len(set(weighted)))  # can't pick more unique winners than unique entrants
+    max_winners = min(gw["winners"], len(set(m.id for m in weighted)))
     for _ in range(max_winners):
         winner_member = random.choice(weighted)
         winners.append(winner_member)
-        chosen_members.add(winner_member.id)
-        # remove all entries of this winner to avoid duplicates
         weighted = [m for m in weighted if m.id != winner_member.id]
         if not weighted:
             break
 
     mention_list = ", ".join(w.mention for w in winners)
     await channel.send(f"🎉 **Giveaway Ended!** Prize: **{gw['prize']}**\nWinner(s): {mention_list}")
+    # cancel scheduled task if any
+    if gw.get("task") and not gw["task"].done():
+        gw["task"].cancel()
     gw["ended"] = True
 
-# /giveaway end
 @giveaway_group.command(name="end", description="End an active giveaway early")
 @app_commands.describe(message_id="Message ID of the giveaway to end")
 async def giveaway_end(interaction: discord.Interaction, message_id: str):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
+        return
     if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
+        await interaction.response.send_message("❌ You need the **Manage Server** permission to use this.", ephemeral=True)
         return
     try:
         mid = int(message_id)
@@ -357,12 +375,14 @@ async def giveaway_end(interaction: discord.Interaction, message_id: str):
     else:
         await interaction.followup.send("❌ Could not find the giveaway channel.", ephemeral=True)
 
-# /giveaway reroll
 @giveaway_group.command(name="reroll", description="Reroll winners for a finished giveaway")
 @app_commands.describe(message_id="Message ID of the finished giveaway")
 async def giveaway_reroll(interaction: discord.Interaction, message_id: str):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
+        return
     if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message("❌ You need Manage Server permission to use this.", ephemeral=True)
+        await interaction.response.send_message("❌ You need the **Manage Server** permission to use this.", ephemeral=True)
         return
     try:
         mid = int(message_id)
@@ -370,7 +390,7 @@ async def giveaway_reroll(interaction: discord.Interaction, message_id: str):
         await interaction.response.send_message("❌ Invalid message ID.", ephemeral=True)
         return
     gw = giveaways.get(mid)
-    if not gw or not gw["ended"]:
+    if not gw or not gw.get("ended"):
         await interaction.response.send_message("❌ Giveaway not found or hasn't ended yet.", ephemeral=True)
         return
     chan = interaction.guild.get_channel(gw["channel_id"])
@@ -378,16 +398,17 @@ async def giveaway_reroll(interaction: discord.Interaction, message_id: str):
         await interaction.response.send_message("❌ Could not find channel.", ephemeral=True)
         return
 
-    # fetch message and reactions same as end (but don't mark ended because it's already ended)
     try:
         msg = await chan.fetch_message(mid)
     except Exception:
         await interaction.response.send_message("❌ Could not fetch giveaway message.", ephemeral=True)
         return
+
     reaction = discord.utils.get(msg.reactions, emoji="🎉")
     if not reaction:
         await interaction.response.send_message("❌ No entries found.", ephemeral=True)
         return
+
     users = await fetch_reaction_users(reaction)
     users = [u for u in users if not u.bot]
     weighted = []
@@ -404,16 +425,15 @@ async def giveaway_reroll(interaction: discord.Interaction, message_id: str):
         for rid, bonus in gw.get("extra_roles", {}).items():
             if discord.utils.get(member.roles, id=rid):
                 entries += bonus
-        weighted.extend([member] * entries)
+        if entries > 0:
+            weighted.extend([member] * entries)
 
     if not weighted:
         await interaction.response.send_message("❌ No eligible participants for reroll.", ephemeral=True)
         return
 
-    # pick single new winner (or pick as many as originally)
     winners = []
-    chosen_members = set()
-    max_winners = min(gw["winners"], len(set(weighted)))
+    max_winners = min(gw["winners"], len(set(m.id for m in weighted)))
     for _ in range(max_winners):
         winner_member = random.choice(weighted)
         winners.append(winner_member)
@@ -423,9 +443,6 @@ async def giveaway_reroll(interaction: discord.Interaction, message_id: str):
 
     mention_list = ", ".join(w.mention for w in winners)
     await interaction.response.send_message(f"🔄 Reroll complete! New winner(s): {mention_list}", ephemeral=False)
-
-# register group
-bot.tree.add_command(giveaway_group)
 
 # -------------------------
 # Other commands (report, suggest, profile, help)
@@ -494,14 +511,14 @@ async def profile(interaction: discord.Interaction, username: str):
 async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(
         title="📖 Tony Studios Bot — Help",
-        description="Use the slash commands. Giveaway example: `/giveaway start duration:1h30m winners:1 prize:Cool Stuff channel:#giveaways`",
+        description="Use the slash commands. Giveaway example:\n`/giveaway start duration:1h30m winners:1 prize:\"Cool Stuff\" channel:#giveaways`",
         color=discord.Color.blurple(),
         timestamp=datetime.utcnow()
     )
     embed.add_field(name="🕹️ /profile", value="View a Roblox user's profile", inline=False)
     embed.add_field(name="🐞 /report", value="Send a bug report", inline=False)
     embed.add_field(name="💡 /suggest", value="Send a suggestion", inline=False)
-    embed.add_field(name="🎉 /giveaway", value="/giveaway start|end|reroll — Manage giveaways", inline=False)
+    embed.add_field(name="🎉 /giveaway start", value="Start a giveaway (admins only)", inline=False)
     embed.set_footer(text=f"Requested by {interaction.user}", icon_url=interaction.user.display_avatar.url)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -528,8 +545,11 @@ async def on_message(message):
             last_number = row[0] if row else 0
 
         if number == last_number + 1:
-            await bot.db.execute("UPDATE counting SET last_number = ? WHERE channel_id = ?", (number, message.channel.id))
-            await bot.db.commit()
+            try:
+                await bot.db.execute("UPDATE counting SET last_number = ? WHERE channel_id = ?", (number, message.channel.id))
+                await bot.db.commit()
+            except Exception:
+                logger.exception("Failed to update counting")
             try:
                 await message.add_reaction("✅")
             except Exception:
@@ -578,8 +598,9 @@ async def on_message(message):
 # -------------------------
 # Run bot
 # -------------------------
-try:
-    bot.run(TOKEN)
-except discord.errors.PrivilegedIntentsRequired:
-    logger.error("⚠️ Enable 'Message Content Intent' & 'Server Members Intent' in the Discord Developer Portal.")
-    raise
+if __name__ == "__main__":
+    try:
+        bot.run(TOKEN)
+    except discord.errors.PrivilegedIntentsRequired:
+        logger.error("⚠️ Enable 'Message Content Intent' & 'Server Members Intent' in the Discord Developer Portal.")
+        raise
