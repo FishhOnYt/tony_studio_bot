@@ -71,15 +71,15 @@ class TonyBot(commands.Bot):
         self.giveaways: Dict[int, dict] = {}
 
     async def setup_hook(self):
-        # create client session and DB
+        # create session & DB, ensure tables, register commands
         self.session = aiohttp.ClientSession()
         self.db = await aiosqlite.connect(DB_PATH)
         await self._ensure_tables()
 
-        # register giveaway group before sync
+        # register giveaway group before syncing
         self.tree.add_command(giveaway_group)
 
-        # global sync
+        # global sync (may take a bit to propagate to all servers)
         await self.tree.sync()
         logger.info("Slash commands synced (global)")
 
@@ -140,6 +140,12 @@ def parse_duration_to_seconds(s: str) -> Optional[int]:
     seconds = parts.get("days", 0) * 86400 + parts.get("hours", 0) * 3600 + parts.get("minutes", 0) * 60 + parts.get("seconds", 0)
     return seconds if seconds > 0 else None
 
+async def fetch_reaction_users(reaction: discord.Reaction) -> List[discord.User]:
+    users = []
+    async for u in reaction.users():
+        users.append(u)
+    return users
+
 def parse_extra_entries_string(s: Optional[str]) -> Dict[int, int]:
     """
     Parse "roleid:bonus,roleid:bonus" or "<@&id>:bonus"
@@ -177,7 +183,7 @@ def calculate_entries_for_member(member: discord.Member, gw_extra: Dict[int, int
     return max(1, entries)
 
 # -------------------------
-# UI: Join button + Participants dropdown (No reaction joining)
+# UI: Join button + Participants dropdown (button-only joins)
 # -------------------------
 class JoinButton(discord.ui.Button):
     def __init__(self, message_id: int, initial_count: int = 0):
@@ -211,7 +217,6 @@ class JoinButton(discord.ui.Button):
 
             # update button label live
             try:
-                # self.view is the parent view; update label and edit message
                 self.label = f"🎉 Join Giveaway ({len(participants)} joined)"
                 if interaction.message:
                     await interaction.message.edit(view=self.view)
@@ -221,7 +226,10 @@ class JoinButton(discord.ui.Button):
             await interaction.response.send_message("✅ You've been entered into the giveaway!", ephemeral=True)
         except Exception:
             logger.exception("JoinButton callback failed")
-            await interaction.response.send_message("Failed to join giveaway.", ephemeral=True)
+            try:
+                await interaction.response.send_message("Failed to join giveaway.", ephemeral=True)
+            except Exception:
+                logger.exception("Also failed to send error response to user")
 
 class ParticipantsSelect(discord.ui.Select):
     def __init__(self, options: List[discord.SelectOption], participants_map: Dict[int, int]):
@@ -237,25 +245,29 @@ class ParticipantsSelect(discord.ui.Select):
             await interaction.response.send_message(text, ephemeral=True)
         except Exception:
             logger.exception("ParticipantsSelect callback failed")
-            await interaction.response.send_message("Failed to fetch participant info.", ephemeral=True)
+            try:
+                await interaction.response.send_message("Failed to fetch participant info.", ephemeral=True)
+            except Exception:
+                logger.exception("Failed to send fallback response")
 
 class ParticipantsView(discord.ui.View):
     def __init__(self, message_id: int, initial_count: int = 0):
         super().__init__(timeout=None)
         self.message_id = message_id
-        # Create JoinButton with initial count
+        # Create JoinButton with initial count and add to view
         self.join_button = JoinButton(message_id, initial_count=initial_count)
         self.add_item(self.join_button)
 
+    # IMPORTANT: correct signature is (self, interaction), not (button, interaction)
     @discord.ui.button(label="View Participants", style=discord.ButtonStyle.primary, emoji="📋")
-    async def view_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+    async def view_button(self, interaction: discord.Interaction):
         try:
             gw = bot.giveaways.get(self.message_id)
             if not gw:
                 await interaction.response.send_message("Giveaway not found (maybe bot restarted).", ephemeral=True)
                 return
 
-            # start with participants from JoinButton entries (no reaction joining)
+            # participants only from button-joins (we intentionally removed reaction joins)
             participants_set: Set[int] = set(gw.get("participants", set()))
 
             if not participants_set:
@@ -267,6 +279,7 @@ class ParticipantsView(discord.ui.View):
             participants_map: Dict[int, int] = {}
             gw_extra = gw.get("extra_roles", {}) or {}
             i = 0
+            # limit to first 25 to fit select
             for uid in list(participants_set):
                 if i >= 25:
                     break
@@ -289,7 +302,10 @@ class ParticipantsView(discord.ui.View):
             await interaction.response.send_message(content=note, view=view, ephemeral=True)
         except Exception:
             logger.exception("View Participants callback failed")
-            await interaction.response.send_message("Could not load participants.", ephemeral=True)
+            try:
+                await interaction.response.send_message("Could not load participants.", ephemeral=True)
+            except Exception:
+                logger.exception("Also failed to send fallback response")
 
 # -------------------------
 # GIVEAWAY GROUP
@@ -344,7 +360,6 @@ async def giveaway_start(
     )
     embed.add_field(name="Host", value=f"{getattr(host, 'mention', str(host))}", inline=True)
     embed.add_field(name="Required Role", value=(required_role.mention if required_role else "None"), inline=True)
-
     # show extra entries summary if provided or global bonuses exist
     extras_text = "None"
     merged_extras = dict(BONUS_ROLES)
@@ -367,7 +382,7 @@ async def giveaway_start(
 
     # build view and attach by editing message (so view has correct message id)
     view = ParticipantsView(message_id=gw_msg.id, initial_count=0)
-    # ensure JoinButton message_id is correct
+    # ensure JoinButton message_id is correct (defensive)
     for item in view.children:
         if isinstance(item, JoinButton):
             item.message_id = gw_msg.id
@@ -377,7 +392,6 @@ async def giveaway_start(
     except Exception:
         # sometimes editing fails if view not allowed; still proceed
         logger.debug("Could not attach view to message by edit; trying to send view separately")
-        # send view in channel so users have access (works but not attached to message)
         try:
             await channel.send("Giveaway controls:", view=view)
         except Exception:
@@ -418,7 +432,6 @@ async def end_giveaway(channel: discord.TextChannel, message_id: int):
         return
 
     try:
-        # attempt to fetch message (for context only)
         msg = await channel.fetch_message(message_id)
     except Exception:
         logger.exception("Failed to fetch giveaway message %s", message_id)
