@@ -1,4 +1,4 @@
-# tony_bot_fixed.py
+# tony_bot_global.py
 import os
 import logging
 import re
@@ -24,14 +24,14 @@ if not TOKEN or not OWNER_ID:
     raise RuntimeError("DISCORD_TOKEN or OWNER_ID missing in .env")
 OWNER_ID = int(OWNER_ID)
 
-GUILD_ID = 984999848791126096  # change if needed
-
+# Counting channels (IDs you use)
 COUNTING_CHANNEL_IDS = [1398545401598050425, 1411772929720586401]
 FAILURE_ROLE_ID = 1210840031023988776
 
-GIVEAWAY_HOST_ROLE_ID = 1402405882939048076  # role allowed to manage giveaways
+# The ONLY role allowed to manage giveaways (users must have this role in the server)
+GIVEAWAY_HOST_ROLE_ID = 1402405882939048076
 
-# default extra entries per role (role_id: bonus_entries)
+# Extra entries per role (role_id: bonus_entries)
 BONUS_ROLES: Dict[int, int] = {
     1411126451163365437: 1,
     1412210602159378462: 2,
@@ -70,17 +70,18 @@ class TonyBot(commands.Bot):
         self.giveaways: Dict[int, dict] = {}  # runtime giveaways store
 
     async def setup_hook(self):
+        # start http session and sqlite
         self.session = aiohttp.ClientSession()
         self.db = await aiosqlite.connect(DB_PATH)
         await self._ensure_tables()
 
-        # register giveaway group before syncing commands
+        # register the giveaway group before syncing commands
         self.tree.add_command(giveaway_group)
 
-        # guild sync for instant availability in your server
-        guild_obj = discord.Object(id=GUILD_ID)
-        await self.tree.sync(guild=guild_obj)
-        logger.info("Commands synced to guild %s", GUILD_ID)
+        # global sync: register commands across all servers the bot is in
+        # (Discord decides when global commands show up per server)
+        await self.tree.sync()
+        logger.info("Global slash commands synced")
 
     async def _ensure_tables(self):
         await self.db.execute("""
@@ -122,6 +123,7 @@ bot = TonyBot()
 # HELPERS
 # -------------------------
 def member_has_giveaway_role(member: discord.Member) -> bool:
+    """Return True if member has the host role in that guild."""
     return any(r.id == GIVEAWAY_HOST_ROLE_ID for r in member.roles)
 
 def parse_duration_to_seconds(s: str) -> Optional[int]:
@@ -158,7 +160,7 @@ def format_extra_entries_field(extra: Optional[Dict[int, int]]) -> str:
     return "\n".join(f"<@&{rid}>: +{bonus}" for rid, bonus in merged.items())
 
 # -------------------------
-# GIVEAWAY GROUP (no guilds on child commands)
+# GIVEAWAY GROUP
 # -------------------------
 giveaway_group = app_commands.Group(name="giveaway", description="Giveaway commands (🎉 to enter)")
 
@@ -182,12 +184,11 @@ async def giveaway_start(
     required_role: Optional[discord.Role] = None,
     extra_entries: Optional[str] = None
 ):
-    # only in guild
+    # Only usable inside a guild
     if not interaction.guild:
         await interaction.response.send_message("❌ Use this command in a server.", ephemeral=True)
         return
 
-    # role lock: check member in guild
     member = interaction.guild.get_member(interaction.user.id)
     if not member or not member_has_giveaway_role(member):
         await interaction.response.send_message("❌ You need the giveaway host role to use this.", ephemeral=True)
@@ -200,7 +201,7 @@ async def giveaway_start(
 
     host = host or interaction.user
 
-    # parse extra_entries param "123:2,456:5" or "<@&123>:2"
+    # parse extra_entries "123:2,456:5" or "<@&123>:2"
     parsed_extra: Dict[int, int] = {}
     if extra_entries:
         parts = [p.strip() for p in extra_entries.split(",") if p.strip()]
@@ -214,7 +215,7 @@ async def giveaway_start(
                     if bonus > 0:
                         parsed_extra[rid] = bonus
                 except Exception:
-                    logger.warning("Couldn't parse extra entry part: %s", p)
+                    logger.warning("Couldn't parse extra entry: %s", p)
 
     ends_at = datetime.utcnow() + timedelta(seconds=seconds)
     relative_ends = discord.utils.format_dt(ends_at, style="R")
@@ -233,7 +234,7 @@ async def giveaway_start(
 
     await interaction.response.send_message(f"✅ Giveaway posted in {channel.mention}", ephemeral=True)
 
-    # post giveaway message
+    # post giveaway
     try:
         gw_msg = await channel.send(embed=embed)
         await gw_msg.add_reaction("🎉")
@@ -242,11 +243,11 @@ async def giveaway_start(
         await interaction.followup.send("❌ I couldn't post in that channel. Check perms.", ephemeral=True)
         return
 
-    # store giveaway runtime state
+    # store runtime state
     bot.giveaways[gw_msg.id] = {
         "prize": prize,
         "channel_id": channel.id,
-        "host_id": getattr(host, "id", None) if isinstance(host, discord.Member) or isinstance(host, discord.User) else None,
+        "host_id": getattr(host, "id", None),
         "required_role_id": required_role.id if required_role else None,
         "extra_roles": parsed_extra,
         "winners": int(winners),
@@ -300,11 +301,9 @@ async def end_giveaway(channel: discord.TextChannel, message_id: int):
             continue
 
         entries = 1
-        # global bonuses
         for rid, bonus in BONUS_ROLES.items():
             if discord.utils.get(m.roles, id=rid):
                 entries += bonus
-        # per-giveaway bonuses
         for rid, bonus in gw.get("extra_roles", {}).items():
             if discord.utils.get(m.roles, id=rid):
                 entries += bonus
@@ -338,7 +337,6 @@ async def end_giveaway(channel: discord.TextChannel, message_id: int):
     result_embed.set_footer(text=FOOTER_TEXT)
     await channel.send(embed=result_embed)
 
-    # cancel auto task if running
     if t := gw.get("task"):
         try:
             t.cancel()
@@ -542,7 +540,7 @@ async def help_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # -------------------------
-# COUNTING GAME
+# COUNTING GAME & LIFECYCLE
 # -------------------------
 @bot.event
 async def on_message(message: discord.Message):
@@ -597,7 +595,6 @@ async def on_message(message: discord.Message):
                 except Exception:
                     logger.exception("Failed to add failure role")
 
-    # react if bot mentioned
     if bot.user in message.mentions:
         try:
             for emoji in ["🇾", "🇪", "🇸", "❓"]:
