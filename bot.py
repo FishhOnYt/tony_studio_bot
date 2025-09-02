@@ -258,9 +258,9 @@ class ParticipantsView(discord.ui.View):
         self.join_button = JoinButton(message_id, initial_count=initial_count)
         self.add_item(self.join_button)
 
-    # IMPORTANT: correct signature is (self, interaction), not (button, interaction)
+    # CORRECT signature: (self, interaction, button)
     @discord.ui.button(label="View Participants", style=discord.ButtonStyle.primary, emoji="📋")
-    async def view_button(self, interaction: discord.Interaction):
+    async def view_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             gw = bot.giveaways.get(self.message_id)
             if not gw:
