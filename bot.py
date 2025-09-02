@@ -4,7 +4,7 @@ import logging
 import random
 import asyncio
 import re
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Set
 
 import discord
 from discord import app_commands
@@ -71,14 +71,15 @@ class TonyBot(commands.Bot):
         self.giveaways: Dict[int, dict] = {}
 
     async def setup_hook(self):
+        # create client session and DB
         self.session = aiohttp.ClientSession()
         self.db = await aiosqlite.connect(DB_PATH)
         await self._ensure_tables()
 
-        # register giveaway group before syncing
+        # register giveaway group before sync
         self.tree.add_command(giveaway_group)
 
-        # global sync (may take a bit to propagate to all servers)
+        # global sync
         await self.tree.sync()
         logger.info("Slash commands synced (global)")
 
@@ -139,12 +140,6 @@ def parse_duration_to_seconds(s: str) -> Optional[int]:
     seconds = parts.get("days", 0) * 86400 + parts.get("hours", 0) * 3600 + parts.get("minutes", 0) * 60 + parts.get("seconds", 0)
     return seconds if seconds > 0 else None
 
-async def fetch_reaction_users(reaction: discord.Reaction) -> List[discord.User]:
-    users = []
-    async for u in reaction.users():
-        users.append(u)
-    return users
-
 def parse_extra_entries_string(s: Optional[str]) -> Dict[int, int]:
     """
     Parse "roleid:bonus,roleid:bonus" or "<@&id>:bonus"
@@ -182,11 +177,11 @@ def calculate_entries_for_member(member: discord.Member, gw_extra: Dict[int, int
     return max(1, entries)
 
 # -------------------------
-# UI: Join button + Participants dropdown
+# UI: Join button + Participants dropdown (No reaction joining)
 # -------------------------
 class JoinButton(discord.ui.Button):
-    def __init__(self, message_id: int):
-        super().__init__(style=discord.ButtonStyle.success, label="Join Giveaway", emoji="🎉")
+    def __init__(self, message_id: int, initial_count: int = 0):
+        super().__init__(style=discord.ButtonStyle.success, label=f"🎉 Join Giveaway ({initial_count} joined)")
         self.message_id = message_id
 
     async def callback(self, interaction: discord.Interaction):
@@ -201,18 +196,28 @@ class JoinButton(discord.ui.Button):
             # required role check
             req = gw.get("required_role_id")
             if req:
-                member = interaction.guild.get_member(uid)
+                member = interaction.guild.get_member(uid) if interaction.guild else None
                 if not member or not discord.utils.get(member.roles, id=req):
                     await interaction.response.send_message("You're missing the required role to join.", ephemeral=True)
                     return
 
-            participants: set = gw.setdefault("participants", set())
+            participants: Set[int] = gw.setdefault("participants", set())
             if uid in participants:
                 await interaction.response.send_message("You're already entered!", ephemeral=True)
                 return
 
             participants.add(uid)
             gw["participants"] = participants
+
+            # update button label live
+            try:
+                # self.view is the parent view; update label and edit message
+                self.label = f"🎉 Join Giveaway ({len(participants)} joined)"
+                if interaction.message:
+                    await interaction.message.edit(view=self.view)
+            except Exception:
+                logger.exception("Failed to update join button label")
+
             await interaction.response.send_message("✅ You've been entered into the giveaway!", ephemeral=True)
         except Exception:
             logger.exception("JoinButton callback failed")
@@ -235,11 +240,12 @@ class ParticipantsSelect(discord.ui.Select):
             await interaction.response.send_message("Failed to fetch participant info.", ephemeral=True)
 
 class ParticipantsView(discord.ui.View):
-    def __init__(self, message_id: int):
+    def __init__(self, message_id: int, initial_count: int = 0):
         super().__init__(timeout=None)
         self.message_id = message_id
-        # Add Join button (message_id will be set properly before edit)
-        self.add_item(JoinButton(message_id))
+        # Create JoinButton with initial count
+        self.join_button = JoinButton(message_id, initial_count=initial_count)
+        self.add_item(self.join_button)
 
     @discord.ui.button(label="View Participants", style=discord.ButtonStyle.primary, emoji="📋")
     async def view_button(self, button: discord.ui.Button, interaction: discord.Interaction):
@@ -249,22 +255,8 @@ class ParticipantsView(discord.ui.View):
                 await interaction.response.send_message("Giveaway not found (maybe bot restarted).", ephemeral=True)
                 return
 
-            # start with participants from JoinButton entries
-            participants_set = set(gw.get("participants", set()))
-
-            # also include reaction joiners
-            chan = bot.get_channel(gw["channel_id"]) or await bot.fetch_channel(gw["channel_id"])
-            if chan:
-                try:
-                    msg = await chan.fetch_message(self.message_id)
-                    reaction = discord.utils.get(msg.reactions, emoji="🎉")
-                    if reaction:
-                        reacted_users = await fetch_reaction_users(reaction)
-                        for u in reacted_users:
-                            if not u.bot:
-                                participants_set.add(u.id)
-                except Exception:
-                    logger.debug("Couldn't fetch message or reactions for participants list")
+            # start with participants from JoinButton entries (no reaction joining)
+            participants_set: Set[int] = set(gw.get("participants", set()))
 
             if not participants_set:
                 await interaction.response.send_message("No participants yet.", ephemeral=True)
@@ -281,13 +273,9 @@ class ParticipantsView(discord.ui.View):
                 # try to get Member object (guild-only)
                 member = interaction.guild.get_member(uid) if interaction.guild else None
                 # calculate entries using roles
-                entries = 1
-                if member:
-                    entries = calculate_entries_for_member(member, gw_extra)
-                else:
-                    entries = 1
+                entries = calculate_entries_for_member(member, gw_extra) if member else 1
                 participants_map[uid] = entries
-                label = (member.display_name if isinstance(member, discord.Member) else f"User {str(uid)}")[:100]
+                label = (member.display_name if member else f"User {str(uid)}")[:100]
                 desc = f"{entries} entry" if entries == 1 else f"{entries} entries"
                 options.append(discord.SelectOption(label=label, description=desc, value=str(uid)))
                 i += 1
@@ -350,12 +338,13 @@ async def giveaway_start(
 
     embed = discord.Embed(
         title="🎉 Giveaway Started!",
-        description=f"**Prize:** {prize}\n**Ends:** {rel_ends}\n**Winners:** {winners}\nPress **Join Giveaway** to enter, or react with 🎉.",
+        description=f"**Prize:** {prize}\n**Ends:** {rel_ends}\n**Winners:** {winners}\nPress **Join Giveaway** to enter.",
         color=discord.Color.gold(),
         timestamp=datetime.utcnow()
     )
-    embed.add_field(name="Host", value=f"{host.mention}", inline=True)
+    embed.add_field(name="Host", value=f"{getattr(host, 'mention', str(host))}", inline=True)
     embed.add_field(name="Required Role", value=(required_role.mention if required_role else "None"), inline=True)
+
     # show extra entries summary if provided or global bonuses exist
     extras_text = "None"
     merged_extras = dict(BONUS_ROLES)
@@ -376,14 +365,8 @@ async def giveaway_start(
         await interaction.followup.send("❌ I couldn't post in that channel. Check my perms.", ephemeral=True)
         return
 
-    # add reaction for people who prefer reactions
-    try:
-        await gw_msg.add_reaction("🎉")
-    except Exception:
-        logger.debug("Could not add 🎉 reaction (missing perms?)")
-
     # build view and attach by editing message (so view has correct message id)
-    view = ParticipantsView(message_id=gw_msg.id)
+    view = ParticipantsView(message_id=gw_msg.id, initial_count=0)
     # ensure JoinButton message_id is correct
     for item in view.children:
         if isinstance(item, JoinButton):
@@ -435,20 +418,15 @@ async def end_giveaway(channel: discord.TextChannel, message_id: int):
         return
 
     try:
+        # attempt to fetch message (for context only)
         msg = await channel.fetch_message(message_id)
     except Exception:
         logger.exception("Failed to fetch giveaway message %s", message_id)
         gw["ended"] = True
         return
 
-    # participants: union of JoinButton participants + reaction users
-    participants_ids = set(gw.get("participants", set()))
-    reaction = discord.utils.get(msg.reactions, emoji="🎉")
-    if reaction:
-        reacted_users = await fetch_reaction_users(reaction)
-        for u in reacted_users:
-            if not u.bot:
-                participants_ids.add(u.id)
+    # participants: only button-based participants (no reactions)
+    participants_ids: Set[int] = set(gw.get("participants", set()))
 
     # filter required role & compute entries
     eligible_list = []
@@ -564,13 +542,8 @@ async def giveaway_reroll(interaction: discord.Interaction, message_id: str):
         await interaction.response.send_message("❌ Couldn't fetch the giveaway message.", ephemeral=True)
         return
 
-    participants_ids = set(gw.get("participants", set()))
-    reaction = discord.utils.get(msg.reactions, emoji="🎉")
-    if reaction:
-        reacted_users = await fetch_reaction_users(reaction)
-        for u in reacted_users:
-            if not u.bot:
-                participants_ids.add(u.id)
+    # participants: only button-based participants (no reactions)
+    participants_ids: Set[int] = set(gw.get("participants", set()))
 
     gw_extra = gw.get("extra_roles", {}) or {}
     eligible_list = []
