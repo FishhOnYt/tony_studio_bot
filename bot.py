@@ -1,10 +1,10 @@
-# tony_bot.py
+# tony_bot_fixed.py
 import os
 import logging
 import re
 import random
 import asyncio
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 import discord
 from discord import app_commands
@@ -14,9 +14,9 @@ from datetime import datetime, timedelta
 import aiohttp
 import aiosqlite
 
-# =========================================================
-#                CONFIG (edit .env for secrets)
-# =========================================================
+# -------------------------
+# CONFIG
+# -------------------------
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_ID = os.getenv("OWNER_ID")
@@ -24,18 +24,15 @@ if not TOKEN or not OWNER_ID:
     raise RuntimeError("DISCORD_TOKEN or OWNER_ID missing in .env")
 OWNER_ID = int(OWNER_ID)
 
-# Guild to instantly sync slash commands to
-GUILD_ID = 984999848791126096  # <-- change if needed
+GUILD_ID = 984999848791126096  # change if needed
 
-# Counting channels (multi)
 COUNTING_CHANNEL_IDS = [1398545401598050425, 1411772929720586401]
 FAILURE_ROLE_ID = 1210840031023988776
 
-# The ONLY role allowed to manage giveaways
-GIVEAWAY_HOST_ROLE_ID = 1402405882939048076
+GIVEAWAY_HOST_ROLE_ID = 1402405882939048076  # role allowed to manage giveaways
 
-# Extra entries per role (role_id: bonus_entries)
-BONUS_ROLES = {
+# default extra entries per role (role_id: bonus_entries)
+BONUS_ROLES: Dict[int, int] = {
     1411126451163365437: 1,
     1412210602159378462: 2,
     1412212184792043530: 3,
@@ -45,15 +42,14 @@ BONUS_ROLES = {
     1412212961338069022: 8,
 }
 
-# Footer promo
 ROBLOX_GROUP_URL = "https://www.roblox.com/share/g/84587582"
 FOOTER_TEXT = f"Join my Roblox group ➜ {ROBLOX_GROUP_URL}"
 
 DB_PATH = "bot_data.db"
 
-# =========================================================
-#                    LOGGING + INTENTS
-# =========================================================
+# -------------------------
+# LOGGING & INTENTS
+# -------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tony_bot")
 
@@ -63,31 +59,28 @@ intents.members = True
 intents.messages = True
 intents.message_content = True
 
-# =========================================================
-#                        BOT
-# =========================================================
+# -------------------------
+# BOT CLASS
+# -------------------------
 class TonyBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="/", intents=intents)
         self.session: Optional[aiohttp.ClientSession] = None
         self.db: Optional[aiosqlite.Connection] = None
-
-        # runtime store: giveaways (not persisted across restarts)
-        self.giveaways: Dict[int, dict] = {}
+        self.giveaways: Dict[int, dict] = {}  # runtime giveaways store
 
     async def setup_hook(self):
-        # http + db
         self.session = aiohttp.ClientSession()
         self.db = await aiosqlite.connect(DB_PATH)
         await self._ensure_tables()
 
-        # register groups before syncing
+        # register giveaway group before syncing commands
         self.tree.add_command(giveaway_group)
 
-        # guild-scoped sync for instant availability
+        # guild sync for instant availability in your server
         guild_obj = discord.Object(id=GUILD_ID)
         await self.tree.sync(guild=guild_obj)
-        logger.info("Slash commands synced to guild %s", GUILD_ID)
+        logger.info("Commands synced to guild %s", GUILD_ID)
 
     async def _ensure_tables(self):
         await self.db.execute("""
@@ -123,19 +116,15 @@ class TonyBot(commands.Bot):
             await self.db.close()
         await super().close()
 
-
 bot = TonyBot()
 
-# =========================================================
-#                      HELPERS
-# =========================================================
-def has_giveaway_role(member: discord.Member) -> bool:
+# -------------------------
+# HELPERS
+# -------------------------
+def member_has_giveaway_role(member: discord.Member) -> bool:
     return any(r.id == GIVEAWAY_HOST_ROLE_ID for r in member.roles)
 
 def parse_duration_to_seconds(s: str) -> Optional[int]:
-    """
-    Accepts '1d', '2h30m', '45m', '90s', '1h30m20s' or raw seconds '3600'.
-    """
     s = (s or "").strip().lower()
     if not s:
         return None
@@ -150,39 +139,38 @@ def parse_duration_to_seconds(s: str) -> Optional[int]:
     seconds = parts.get("days", 0) * 86400 + parts.get("hours", 0) * 3600 + parts.get("minutes", 0) * 60 + parts.get("seconds", 0)
     return seconds if seconds > 0 else None
 
-async def fetch_reaction_users(reaction: discord.Reaction):
-    users = []
+async def fetch_reaction_users(reaction: discord.Reaction) -> List[discord.User]:
+    users: List[discord.User] = []
     async for u in reaction.users():
         users.append(u)
     return users
 
-def extra_entries_field_text(extra: Optional[Dict[int, int]]) -> str:
+def merge_extra_entries(extra: Optional[Dict[int, int]]) -> Dict[int, int]:
     merged = dict(BONUS_ROLES)
     if extra:
         merged.update(extra)
+    return merged
+
+def format_extra_entries_field(extra: Optional[Dict[int, int]]) -> str:
+    merged = merge_extra_entries(extra)
     if not merged:
         return "None"
     return "\n".join(f"<@&{rid}>: +{bonus}" for rid, bonus in merged.items())
 
-# =========================================================
-#                      GIVEAWAY GROUP
-# =========================================================
-giveaway_group = app_commands.Group(
-    name="giveaway",
-    description="Giveaway commands (🎉 to enter)",
-    guild_ids=[GUILD_ID],  # fast register to this guild
-)
+# -------------------------
+# GIVEAWAY GROUP (no guilds on child commands)
+# -------------------------
+giveaway_group = app_commands.Group(name="giveaway", description="Giveaway commands (🎉 to enter)")
 
 @giveaway_group.command(name="start", description="Start a giveaway (role-locked)")
-@app_commands.guilds(discord.Object(id=GUILD_ID))
 @app_commands.describe(
-    duration="e.g. 1h30m, 45m, 90s, or 3600",
-    winners="Number of winners (1-10)",
-    prize="What are you giving away?",
-    channel="Channel to post the giveaway",
-    host="Giveaway host (defaults to you)",
-    required_role="Role required to be eligible (optional)",
-    extra_entries="Optional: roleid:bonus,roleid:bonus (IDs or <@&id>)"
+    duration="Duration (e.g. 1h30m, 45m, 90s, or seconds)",
+    winners="Winners (1-10)",
+    prize="Prize text",
+    channel="Channel to post giveaway in",
+    host="Host (defaults to you)",
+    required_role="Role required to enter (optional)",
+    extra_entries="Optional extra entries roleid:bonus,roleid:bonus (IDs or <@&id>)"
 )
 async def giveaway_start(
     interaction: discord.Interaction,
@@ -194,86 +182,79 @@ async def giveaway_start(
     required_role: Optional[discord.Role] = None,
     extra_entries: Optional[str] = None
 ):
-    # must be in a server
+    # only in guild
     if not interaction.guild:
-        await interaction.response.send_message("❌ Use this in a server.", ephemeral=True)
+        await interaction.response.send_message("❌ Use this command in a server.", ephemeral=True)
         return
 
-    # role lock
-    if not has_giveaway_role(interaction.user):
+    # role lock: check member in guild
+    member = interaction.guild.get_member(interaction.user.id)
+    if not member or not member_has_giveaway_role(member):
         await interaction.response.send_message("❌ You need the giveaway host role to use this.", ephemeral=True)
         return
 
     seconds = parse_duration_to_seconds(duration)
     if seconds is None:
-        await interaction.response.send_message(
-            "❌ Invalid duration. Examples: `1h30m`, `45m`, `90s`, or `3600`.",
-            ephemeral=True
-        )
+        await interaction.response.send_message("❌ Invalid duration. Examples: `1h30m`, `45m`, `90s`, or `3600`.", ephemeral=True)
         return
 
     host = host or interaction.user
 
-    # parse extra entries
-    parsed_extra = {}
+    # parse extra_entries param "123:2,456:5" or "<@&123>:2"
+    parsed_extra: Dict[int, int] = {}
     if extra_entries:
         parts = [p.strip() for p in extra_entries.split(",") if p.strip()]
         for p in parts:
             cleaned = p.replace("<@&", "").replace(">", "").strip()
             if ":" in cleaned:
-                rid_str, bonus_str = cleaned.split(":", 1)
+                left, right = cleaned.split(":", 1)
                 try:
-                    rid = int(rid_str.strip())
-                    bonus = int(bonus_str.strip())
+                    rid = int(left.strip())
+                    bonus = int(right.strip())
                     if bonus > 0:
                         parsed_extra[rid] = bonus
                 except Exception:
-                    logger.warning("Couldn't parse extra entry: %s", p)
+                    logger.warning("Couldn't parse extra entry part: %s", p)
 
-    # build embed
     ends_at = datetime.utcnow() + timedelta(seconds=seconds)
-    ends_str = discord.utils.format_dt(ends_at, style="R")  # relative time
+    relative_ends = discord.utils.format_dt(ends_at, style="R")
+
     embed = discord.Embed(
         title="🎉 Giveaway Started!",
-        description=(
-            f"**Prize:** {prize}\n"
-            f"React with 🎉 to enter.\n"
-            f"**Ends:** {ends_str}\n"
-            f"**Winners:** {winners}"
-        ),
+        description=f"**Prize:** {prize}\nReact with 🎉 to enter.\n**Ends:** {relative_ends}\n**Winners:** {winners}",
         color=discord.Color.gold(),
         timestamp=datetime.utcnow()
     )
-    embed.add_field(name="Host", value=host.mention, inline=True)
+    embed.add_field(name="Host", value=str(host), inline=True)
     embed.add_field(name="Required Role", value=(required_role.mention if required_role else "None"), inline=True)
-    embed.add_field(name="Extra Entries", value=extra_entries_field_text(parsed_extra), inline=False)
+    embed.add_field(name="Extra Entries", value=format_extra_entries_field(parsed_extra), inline=False)
     embed.add_field(name="Community", value=f"[Join our Roblox group]({ROBLOX_GROUP_URL})", inline=False)
     embed.set_footer(text=FOOTER_TEXT)
 
-    # send confirmation + post
     await interaction.response.send_message(f"✅ Giveaway posted in {channel.mention}", ephemeral=True)
 
+    # post giveaway message
     try:
         gw_msg = await channel.send(embed=embed)
         await gw_msg.add_reaction("🎉")
     except Exception:
-        logger.exception("Failed to send giveaway message or add reaction")
-        await interaction.followup.send("❌ I couldn't post in that channel. Check my perms.", ephemeral=True)
+        logger.exception("Failed to post giveaway")
+        await interaction.followup.send("❌ I couldn't post in that channel. Check perms.", ephemeral=True)
         return
 
-    # store runtime state
+    # store giveaway runtime state
     bot.giveaways[gw_msg.id] = {
         "prize": prize,
         "channel_id": channel.id,
-        "host_id": host.id,
+        "host_id": getattr(host, "id", None) if isinstance(host, discord.Member) or isinstance(host, discord.User) else None,
         "required_role_id": required_role.id if required_role else None,
         "extra_roles": parsed_extra,
         "winners": int(winners),
         "ends_at": ends_at,
         "ended": False,
+        "task": None
     }
 
-    # schedule end
     async def _auto_end(mid: int, chan_id: int, wait_s: int):
         try:
             await asyncio.sleep(wait_s)
@@ -281,12 +262,12 @@ async def giveaway_start(
             if chan:
                 await end_giveaway(chan, mid)
         except asyncio.CancelledError:
-            pass
+            return
         except Exception:
             logger.exception("Auto-end failed for giveaway %s", mid)
 
-    bot.giveaways[gw_msg.id]["task"] = asyncio.create_task(_auto_end(gw_msg.id, channel.id, seconds))
-
+    task = asyncio.create_task(_auto_end(gw_msg.id, channel.id, seconds))
+    bot.giveaways[gw_msg.id]["task"] = task
 
 async def end_giveaway(channel: discord.TextChannel, message_id: int):
     gw = bot.giveaways.get(message_id)
@@ -309,13 +290,11 @@ async def end_giveaway(channel: discord.TextChannel, message_id: int):
     users = await fetch_reaction_users(reaction)
     users = [u for u in users if not u.bot]
 
-    # build weighted list
-    weighted = []
+    weighted: List[discord.Member] = []
     for u in users:
         m = channel.guild.get_member(u.id)
         if not m:
             continue
-        # required role gate
         req_id = gw.get("required_role_id")
         if req_id and not discord.utils.get(m.roles, id=req_id):
             continue
@@ -339,11 +318,10 @@ async def end_giveaway(channel: discord.TextChannel, message_id: int):
         return
 
     winners_to_pick = min(gw["winners"], len(set(m.id for m in weighted)))
-    winners = []
+    winners: List[discord.Member] = []
     for _ in range(winners_to_pick):
         pick = random.choice(weighted)
         winners.append(pick)
-        # remove all of winner's entries to avoid duplicate wins
         weighted = [m for m in weighted if m.id != pick.id]
         if not weighted:
             break
@@ -360,7 +338,7 @@ async def end_giveaway(channel: discord.TextChannel, message_id: int):
     result_embed.set_footer(text=FOOTER_TEXT)
     await channel.send(embed=result_embed)
 
-    # mark ended + cancel task
+    # cancel auto task if running
     if t := gw.get("task"):
         try:
             t.cancel()
@@ -368,15 +346,14 @@ async def end_giveaway(channel: discord.TextChannel, message_id: int):
             pass
     gw["ended"] = True
 
-
 @giveaway_group.command(name="end", description="End a giveaway early (role-locked)")
-@app_commands.guilds(discord.Object(id=GUILD_ID))
 @app_commands.describe(message_id="Message ID of the giveaway message")
 async def giveaway_end(interaction: discord.Interaction, message_id: str):
     if not interaction.guild:
         await interaction.response.send_message("❌ Use this in a server.", ephemeral=True)
         return
-    if not has_giveaway_role(interaction.user):
+    member = interaction.guild.get_member(interaction.user.id)
+    if not member or not member_has_giveaway_role(member):
         await interaction.response.send_message("❌ You need the giveaway host role.", ephemeral=True)
         return
     try:
@@ -384,29 +361,25 @@ async def giveaway_end(interaction: discord.Interaction, message_id: str):
     except ValueError:
         await interaction.response.send_message("❌ Invalid message ID.", ephemeral=True)
         return
-
     gw = bot.giveaways.get(mid)
     if not gw:
         await interaction.response.send_message("❌ Giveaway not found.", ephemeral=True)
         return
-
     chan = interaction.guild.get_channel(gw["channel_id"])
     if not chan:
         await interaction.response.send_message("❌ Giveaway channel not found.", ephemeral=True)
         return
-
     await interaction.response.send_message("✅ Ending giveaway…", ephemeral=True)
     await end_giveaway(chan, mid)
 
-
-@giveaway_group.command(name="reroll", description="Reroll winners (role-locked)")
-@app_commands.guilds(discord.Object(id=GUILD_ID))
-@app_commands.describe(message_id="Message ID of a finished giveaway")
+@giveaway_group.command(name="reroll", description="Reroll winners for a finished giveaway (role-locked)")
+@app_commands.describe(message_id="Message ID of the finished giveaway")
 async def giveaway_reroll(interaction: discord.Interaction, message_id: str):
     if not interaction.guild:
         await interaction.response.send_message("❌ Use this in a server.", ephemeral=True)
         return
-    if not has_giveaway_role(interaction.user):
+    member = interaction.guild.get_member(interaction.user.id)
+    if not member or not member_has_giveaway_role(member):
         await interaction.response.send_message("❌ You need the giveaway host role.", ephemeral=True)
         return
     try:
@@ -414,12 +387,10 @@ async def giveaway_reroll(interaction: discord.Interaction, message_id: str):
     except ValueError:
         await interaction.response.send_message("❌ Invalid message ID.", ephemeral=True)
         return
-
     gw = bot.giveaways.get(mid)
     if not gw or not gw.get("ended"):
-        await interaction.response.send_message("❌ Giveaway not found or not ended yet.", ephemeral=True)
+        await interaction.response.send_message("❌ Giveaway not found or hasn't ended yet.", ephemeral=True)
         return
-
     chan = interaction.guild.get_channel(gw["channel_id"])
     if not chan:
         await interaction.response.send_message("❌ Giveaway channel not found.", ephemeral=True)
@@ -439,7 +410,7 @@ async def giveaway_reroll(interaction: discord.Interaction, message_id: str):
     users = await fetch_reaction_users(reaction)
     users = [u for u in users if not u.bot]
 
-    weighted = []
+    weighted: List[discord.Member] = []
     for u in users:
         m = chan.guild.get_member(u.id)
         if not m:
@@ -455,7 +426,6 @@ async def giveaway_reroll(interaction: discord.Interaction, message_id: str):
         for rid, bonus in gw.get("extra_roles", {}).items():
             if discord.utils.get(m.roles, id=rid):
                 entries += bonus
-
         if entries > 0:
             weighted.extend([m] * entries)
 
@@ -464,7 +434,7 @@ async def giveaway_reroll(interaction: discord.Interaction, message_id: str):
         return
 
     winners_to_pick = min(gw["winners"], len(set(m.id for m in weighted)))
-    winners = []
+    winners: List[discord.Member] = []
     for _ in range(winners_to_pick):
         pick = random.choice(weighted)
         winners.append(pick)
@@ -475,12 +445,12 @@ async def giveaway_reroll(interaction: discord.Interaction, message_id: str):
     mentions = ", ".join(w.mention for w in winners)
     await interaction.response.send_message(f"🔄 New winner(s): {mentions}", ephemeral=False)
 
-# =========================================================
-#                      OTHER COMMANDS
-# =========================================================
+# -------------------------
+# Other commands (profile, report, suggest, help)
+# -------------------------
 ROBLOX_USERS = "https://users.roblox.com/v1/usernames/users"
 
-async def roblox_get_user(session, username):
+async def roblox_get_user(session: aiohttp.ClientSession, username: str) -> Optional[dict]:
     try:
         async with session.post(ROBLOX_USERS, json={"usernames": [username], "excludeBannedUsers": False}) as resp:
             data = await resp.json()
@@ -491,7 +461,6 @@ async def roblox_get_user(session, username):
     return None
 
 @bot.tree.command(name="profile", description="View a Roblox user's profile")
-@app_commands.guilds(discord.Object(id=GUILD_ID))
 @app_commands.describe(username="Roblox username")
 async def profile(interaction: discord.Interaction, username: str):
     await interaction.response.defer(ephemeral=False)
@@ -520,23 +489,15 @@ async def profile(interaction: discord.Interaction, username: str):
     await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="report", description="Send a bug report to the bot owner")
-@app_commands.guilds(discord.Object(id=GUILD_ID))
 @app_commands.describe(bug="Describe the bug")
 async def report(interaction: discord.Interaction, bug: str):
-    embed = discord.Embed(
-        title="🐞 Bug Report",
-        description=bug,
-        color=discord.Color.red(),
-        timestamp=datetime.utcnow()
-    ).set_footer(text=FOOTER_TEXT)
-    embed.add_field(name="Community", value=f"[Join our Roblox group]({ROBLOX_GROUP_URL})", inline=False)
+    embed = discord.Embed(title="🐞 Bug Report", description=bug, color=discord.Color.red(), timestamp=datetime.utcnow())
     embed.set_author(name=str(interaction.user), icon_url=interaction.user.display_avatar.url)
+    embed.add_field(name="Community", value=f"[Join our Roblox group]({ROBLOX_GROUP_URL})", inline=False)
+    embed.set_footer(text=FOOTER_TEXT)
     await interaction.response.send_message("✅ Your bug report was sent!", ephemeral=True)
-    await bot.db.execute("INSERT INTO reports (user_id, username, content) VALUES (?, ?, ?)",
-                         (interaction.user.id, str(interaction.user), bug))
+    await bot.db.execute("INSERT INTO reports (user_id, username, content) VALUES (?, ?, ?)", (interaction.user.id, str(interaction.user), bug))
     await bot.db.commit()
-
-    # DM owner
     try:
         owner = await bot.fetch_user(OWNER_ID)
         if owner:
@@ -545,22 +506,15 @@ async def report(interaction: discord.Interaction, bug: str):
         logger.exception("Failed to DM owner")
 
 @bot.tree.command(name="suggest", description="Send a suggestion to the bot owner")
-@app_commands.guilds(discord.Object(id=GUILD_ID))
 @app_commands.describe(idea="Your suggestion")
 async def suggest(interaction: discord.Interaction, idea: str):
-    embed = discord.Embed(
-        title="💡 Suggestion",
-        description=idea,
-        color=discord.Color.green(),
-        timestamp=datetime.utcnow()
-    ).set_footer(text=FOOTER_TEXT)
-    embed.add_field(name="Community", value=f"[Join our Roblox group]({ROBLOX_GROUP_URL})", inline=False)
+    embed = discord.Embed(title="💡 Suggestion", description=idea, color=discord.Color.green(), timestamp=datetime.utcnow())
     embed.set_author(name=str(interaction.user), icon_url=interaction.user.display_avatar.url)
+    embed.add_field(name="Community", value=f"[Join our Roblox group]({ROBLOX_GROUP_URL})", inline=False)
+    embed.set_footer(text=FOOTER_TEXT)
     await interaction.response.send_message("✅ Your suggestion was sent!", ephemeral=True)
-    await bot.db.execute("INSERT INTO suggestions (user_id, username, content) VALUES (?, ?, ?)",
-                         (interaction.user.id, str(interaction.user), idea))
+    await bot.db.execute("INSERT INTO suggestions (user_id, username, content) VALUES (?, ?, ?)", (interaction.user.id, str(interaction.user), idea))
     await bot.db.commit()
-
     try:
         owner = await bot.fetch_user(OWNER_ID)
         if owner:
@@ -569,14 +523,12 @@ async def suggest(interaction: discord.Interaction, idea: str):
         logger.exception("Failed to DM owner")
 
 @bot.tree.command(name="help", description="Show all bot commands")
-@app_commands.guilds(discord.Object(id=GUILD_ID))
 async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(
         title="📖 Tony Studios — Help",
         description=(
-            "Use the slash commands below. Giveaway example:\n"
-            "`/giveaway start duration:1h30m winners:2 prize:\"Nitro\" channel:#giveaways "
-            "host:@You required_role:@Members extra_entries:123:2,456:5`"
+            "Giveaway example:\n"
+            "`/giveaway start duration:1h30m winners:2 prize:\"Nitro\" channel:#giveaways host:@You required_role:@Members extra_entries:123:2,456:5`"
         ),
         color=discord.Color.blurple(),
         timestamp=datetime.utcnow()
@@ -589,9 +541,9 @@ async def help_command(interaction: discord.Interaction):
     embed.set_footer(text=FOOTER_TEXT)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# =========================================================
-#                    COUNTING GAME
-# =========================================================
+# -------------------------
+# COUNTING GAME
+# -------------------------
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -604,26 +556,15 @@ async def on_message(message: discord.Message):
             await bot.process_commands(message)
             return
 
-        # ensure row
-        await bot.db.execute(
-            "INSERT OR IGNORE INTO counting (channel_id, last_number) VALUES (?, ?)",
-            (message.channel.id, 0)
-        )
+        await bot.db.execute("INSERT OR IGNORE INTO counting (channel_id, last_number) VALUES (?, ?)", (message.channel.id, 0))
         await bot.db.commit()
 
-        # get last
-        async with bot.db.execute(
-            "SELECT last_number FROM counting WHERE channel_id = ?",
-            (message.channel.id,)
-        ) as cur:
+        async with bot.db.execute("SELECT last_number FROM counting WHERE channel_id = ?", (message.channel.id,)) as cur:
             row = await cur.fetchone()
             last = row[0] if row else 0
 
         if number == last + 1:
-            await bot.db.execute(
-                "UPDATE counting SET last_number = ? WHERE channel_id = ?",
-                (number, message.channel.id)
-            )
+            await bot.db.execute("UPDATE counting SET last_number = ? WHERE channel_id = ?", (number, message.channel.id))
             await bot.db.commit()
             try:
                 await message.add_reaction("✅")
@@ -634,10 +575,7 @@ async def on_message(message: discord.Message):
             try:
                 bot_msg = await message.channel.send(str(next_num))
                 await bot_msg.add_reaction("✅")
-                await bot.db.execute(
-                    "UPDATE counting SET last_number = ? WHERE channel_id = ?",
-                    (next_num, message.channel.id)
-                )
+                await bot.db.execute("UPDATE counting SET last_number = ? WHERE channel_id = ?", (next_num, message.channel.id))
                 await bot.db.commit()
             except Exception:
                 logger.exception("Failed to send next number")
@@ -646,16 +584,12 @@ async def on_message(message: discord.Message):
                 await message.add_reaction("❌")
             except Exception:
                 logger.exception("Failed to react ❌")
-            await bot.db.execute(
-                "UPDATE counting SET last_number = 0 WHERE channel_id = ?",
-                (message.channel.id,)
-            )
+            await bot.db.execute("UPDATE counting SET last_number = 0 WHERE channel_id = ?", (message.channel.id,))
             await bot.db.commit()
             try:
                 await message.channel.send(f"❌ {message.author.mention} fumbled the count! Start again at **1**.")
             except Exception:
                 logger.exception("Failed to send failure msg")
-
             role = message.guild.get_role(FAILURE_ROLE_ID) if message.guild else None
             if role:
                 try:
@@ -673,9 +607,9 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-# =========================================================
-#                       LIFECYCLE
-# =========================================================
+# -------------------------
+# LIFECYCLE
+# -------------------------
 @bot.event
 async def on_ready():
     logger.info(f"Logged in as {bot.user} ({bot.user.id})")
