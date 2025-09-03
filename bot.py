@@ -47,6 +47,9 @@ FOOTER_TEXT = f"Join my Roblox group ➜ {ROBLOX_GROUP_URL}"
 
 DB_PATH = "bot_data.db"
 
+# Easter egg gif for 67
+EASTER_EGG_67_GIF = "https://tenor.com/view/67-gif-8575841764206736991"
+
 # -------------------------
 # LOGGING & INTENTS
 # -------------------------
@@ -69,6 +72,8 @@ class TonyBot(commands.Bot):
         self.db: Optional[aiosqlite.Connection] = None
         # runtime giveaways store: message_id -> giveaway data
         self.giveaways: Dict[int, dict] = {}
+        # locks per counting channel to prevent race conditions
+        self.count_locks: Dict[int, asyncio.Lock] = {}
 
     async def setup_hook(self):
         # create session & DB, ensure tables, register commands
@@ -454,7 +459,15 @@ async def end_giveaway(channel: discord.TextChannel, message_id: int):
         eligible_list.append((uid, calculate_entries_for_member(m, gw_extra)))
 
     if not eligible_list:
-        await channel.send("❌ No eligible entries.")
+        # edit original message to indicate ended with no winners
+        embed = msg.embeds[0] if msg.embeds else discord.Embed()
+        embed.title = "❌ Giveaway Ended!"
+        embed.description = f"**Prize:** {gw['prize']}\nNo eligible entries."
+        embed.color = discord.Color.red()
+        try:
+            await msg.edit(embed=embed, view=None)
+        except Exception:
+            logger.exception("Failed to edit giveaway message after end (no eligible).")
         gw["ended"] = True
         return
 
@@ -477,19 +490,16 @@ async def end_giveaway(channel: discord.TextChannel, message_id: int):
         member = channel.guild.get_member(uid)
         mentions.append(member.mention if member else f"<@{uid}>")
 
-    host_id = gw.get("host_id")
-    host_mention = f"<@{host_id}>" if host_id else "the host"
-
-    result_embed = discord.Embed(
-        title="🎉 Giveaway Ended!",
-        description=f"**Prize:** {gw['prize']}\n**Winner(s):** {', '.join(mentions)}",
-        color=discord.Color.green(),
-        timestamp=datetime.utcnow()
-    )
-    result_embed.add_field(name="Claim", value=f"DM {host_mention} to claim your prize!", inline=False)
-    result_embed.add_field(name="Community", value=f"[Join our Roblox group]({ROBLOX_GROUP_URL})", inline=False)
-    result_embed.set_footer(text=FOOTER_TEXT)
-    await channel.send(embed=result_embed)
+    # EDIT the original giveaway message embed to show winners and remove buttons
+    embed = msg.embeds[0] if msg.embeds else discord.Embed()
+    embed.title = "🎉 Giveaway Ended!"
+    embed.description = f"**Prize:** {gw['prize']}\n**Winner(s):** {', '.join(mentions)}"
+    embed.color = discord.Color.green()
+    embed.set_footer(text=FOOTER_TEXT)
+    try:
+        await msg.edit(embed=embed, view=None)
+    except Exception:
+        logger.exception("Failed to edit giveaway message after end (winners).")
 
     # cancel auto-task
     if t := gw.get("task"):
@@ -692,58 +702,106 @@ async def help_command(interaction: discord.Interaction):
 # -------------------------
 # COUNTING GAME
 # -------------------------
+NUMBER_RE = re.compile(r"\d+")
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
+    # Counting channel logic
     if message.channel.id in COUNTING_CHANNEL_IDS:
-        try:
-            number = int(message.content.strip())
-        except ValueError:
+        # find the first integer in the message (if any)
+        m = NUMBER_RE.search(message.content or "")
+        if not m:
+            # no number, let normal commands run
             await bot.process_commands(message)
             return
 
-        await bot.db.execute("INSERT OR IGNORE INTO counting (channel_id, last_number) VALUES (?, ?)", (message.channel.id, 0))
-        await bot.db.commit()
+        # parse the integer
+        try:
+            number = int(m.group())
+        except Exception:
+            # if something weird happens, skip counting but process commands
+            await bot.process_commands(message)
+            return
 
-        async with bot.db.execute("SELECT last_number FROM counting WHERE channel_id = ?", (message.channel.id,)) as cur:
-            row = await cur.fetchone()
-            last = row[0] if row else 0
-
-        if number == last + 1:
-            await bot.db.execute("UPDATE counting SET last_number = ? WHERE channel_id = ?", (number, message.channel.id))
-            await bot.db.commit()
-            try:
-                await message.add_reaction("✅")
-            except Exception:
-                logger.exception("Failed to react ✅")
-
-            next_num = number + 1
-            try:
-                bot_msg = await message.channel.send(str(next_num))
-                await bot_msg.add_reaction("✅")
-                await bot.db.execute("UPDATE counting SET last_number = ? WHERE channel_id = ?", (next_num, message.channel.id))
-                await bot.db.commit()
-            except Exception:
-                logger.exception("Failed to send next number")
-        else:
-            try:
-                await message.add_reaction("❌")
-            except Exception:
-                logger.exception("Failed to react ❌")
-            await bot.db.execute("UPDATE counting SET last_number = 0 WHERE channel_id = ?", (message.channel.id,))
-            await bot.db.commit()
-            try:
-                await message.channel.send(f"❌ {message.author.mention} fumbled the count! Start again at **1**.")
-            except Exception:
-                logger.exception("Failed to send failure msg")
-            role = message.guild.get_role(FAILURE_ROLE_ID) if message.guild else None
-            if role:
+        # easter egg: if number is 67, reply to the user's message with the gif
+        try:
+            if number == 67:
+                # reply to that message with the gif URL (Discord will unfurl the tenor link)
                 try:
-                    await message.author.add_roles(role, reason="Failed counting game")
+                    await message.reply(EASTER_EGG_67_GIF)
                 except Exception:
-                    logger.exception("Failed to add failure role")
+                    logger.exception("Failed to send 67 easter-egg reply")
+        except Exception:
+            logger.exception("Easter egg handling failed")
+
+        # get or create a lock for this channel to avoid race conditions
+        lock = bot.count_locks.get(message.channel.id)
+        if lock is None:
+            lock = asyncio.Lock()
+            bot.count_locks[message.channel.id] = lock
+
+        async with lock:
+            try:
+                # ensure row exists
+                await bot.db.execute("INSERT OR IGNORE INTO counting (channel_id, last_number) VALUES (?, ?)", (message.channel.id, 0))
+                await bot.db.commit()
+
+                async with bot.db.execute("SELECT last_number FROM counting WHERE channel_id = ?", (message.channel.id,)) as cur:
+                    row = await cur.fetchone()
+                    last = row[0] if row else 0
+
+                # VALID: message number must be exactly last+1
+                if number == last + 1:
+                    # update DB to reflect the last valid user number (do NOT set to the bot's prompt number)
+                    await bot.db.execute("UPDATE counting SET last_number = ? WHERE channel_id = ?", (number, message.channel.id))
+                    await bot.db.commit()
+
+                    # react to the user's message as confirmation
+                    try:
+                        await message.add_reaction("✅")
+                    except Exception:
+                        logger.exception("Failed to react ✅")
+
+                    # send the next number as a prompt (bot posts next_num) but we DO NOT store it as last_number
+                    next_num = number + 1
+                    try:
+                        bot_msg = await message.channel.send(str(next_num))
+                        try:
+                            await bot_msg.add_reaction("✅")
+                        except Exception:
+                            logger.exception("Failed to react to bot prompt")
+                    except Exception:
+                        logger.exception("Failed to send next number prompt")
+                else:
+                    # incorrect number -> fumble: reset to 0
+                    try:
+                        await message.add_reaction("❌")
+                    except Exception:
+                        logger.exception("Failed to react ❌")
+                    await bot.db.execute("UPDATE counting SET last_number = 0 WHERE channel_id = ?", (message.channel.id,))
+                    await bot.db.commit()
+                    try:
+                        await message.channel.send(f"❌ {message.author.mention} fumbled the count! Start again at **1**.")
+                    except Exception:
+                        logger.exception("Failed to send failure msg")
+                    # add failure role if configured
+                    role = message.guild.get_role(FAILURE_ROLE_ID) if message.guild else None
+                    if role:
+                        try:
+                            await message.author.add_roles(role, reason="Failed counting game")
+                        except Exception:
+                            logger.exception("Failed to add failure role")
+            except Exception:
+                logger.exception("Counting logic failed")
+                # fallback: process commands if any
+                await bot.process_commands(message)
+                return
+
+        # don't run normal command processing twice (we already handled it)
+        return
 
     # react if bot mentioned
     if bot.user in message.mentions:
@@ -753,6 +811,7 @@ async def on_message(message: discord.Message):
         except Exception:
             logger.exception("Failed to react to mention")
 
+    # allow other commands to run
     await bot.process_commands(message)
 
 # -------------------------
