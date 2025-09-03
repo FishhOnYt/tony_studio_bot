@@ -4,7 +4,7 @@ import logging
 import random
 import asyncio
 import re
-from typing import Optional, Dict, List, Set
+from typing import Optional, Dict, List, Set, Any
 
 import discord
 from discord import app_commands
@@ -76,12 +76,14 @@ class TonyBot(commands.Bot):
         self.count_locks: Dict[int, asyncio.Lock] = {}
         # guard for creating locks
         self._locks_registry_lock = asyncio.Lock()
+        # pending bot prompts per channel (in-memory)
+        # channel_id -> {"prompt_num": int, "msg_id": int, "ts": datetime}
+        self.pending_prompts: Dict[int, Dict[str, Any]] = {}
 
     async def setup_hook(self):
         # create session & DB, ensure tables, register commands
         self.session = aiohttp.ClientSession()
         self.db = await aiosqlite.connect(DB_PATH)
-        # ensure rows are returned as tuples
         self.db.row_factory = aiosqlite.Row
         await self._ensure_tables()
 
@@ -193,7 +195,6 @@ def calculate_entries_for_member(member: discord.Member, gw_extra: Dict[int, int
 
 # -------------------------
 # UI: Join button + Participants dropdown (button-only joins)
-# (unchanged from previous working version)
 # -------------------------
 class JoinButton(discord.ui.Button):
     def __init__(self, message_id: int, initial_count: int = 0):
@@ -611,7 +612,6 @@ async def giveaway_reroll(interaction: discord.Interaction, message_id: str):
 
 # -------------------------
 # Other commands (profile, report, suggest, help)
-# (unchanged)
 # -------------------------
 ROBLOX_USERS = "https://users.roblox.com/v1/usernames/users"
 
@@ -707,10 +707,22 @@ async def help_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # -------------------------
-# COUNTING GAME (fixed & atomic)
+# COUNTING GAME (fixed & accepts skip-over prompts)
 # -------------------------
 # match first sequence of digits anywhere
 NUMBER_RE = re.compile(r"(?<!\d)(\d+)(?!\d)")
+
+async def _set_pending_prompt(channel_id: int, prompt_num: int, msg_id: int):
+    # store pending prompt in memory (short-lived)
+    bot.pending_prompts[channel_id] = {"prompt_num": prompt_num, "msg_id": msg_id, "ts": datetime.utcnow()}
+
+async def _clear_pending_prompt_if_outdated(channel_id: int):
+    p = bot.pending_prompts.get(channel_id)
+    if not p:
+        return
+    # clear if older than 5 minutes (safety)
+    if (datetime.utcnow() - p["ts"]).total_seconds() > 300:
+        bot.pending_prompts.pop(channel_id, None)
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -752,6 +764,9 @@ async def on_message(message: discord.Message):
         # critical section per-channel
         async with lock:
             try:
+                # cleanup outdated pending prompt
+                await _clear_pending_prompt_if_outdated(message.channel.id)
+
                 # start an immediate transaction to lock row for this channel
                 await bot.db.execute("BEGIN IMMEDIATE")
                 # ensure row exists
@@ -763,8 +778,40 @@ async def on_message(message: discord.Message):
 
                 logger.debug("Channel %s last_number=%s incoming=%s", message.channel.id, last, number)
 
+                accepted = False
+
+                # Case 1: exact next number
                 if number == last + 1:
-                    # valid hit: store the user's number
+                    accepted = True
+                else:
+                    # Case 2: user skipped bot prompt: user posted last+2 while bot already posted last+1 as a prompt.
+                    # Check in-memory pending prompt first:
+                    pend = bot.pending_prompts.get(message.channel.id)
+                    if number == last + 2 and pend and pend.get("prompt_num") == last + 1:
+                        accepted = True
+                    else:
+                        # fallback: check if a recent bot message with content == last+1 exists (scan last 10 messages)
+                        if number == last + 2:
+                            try:
+                                async for hist_msg in message.channel.history(limit=10, after=None):
+                                    if hist_msg.author == bot.user:
+                                        # normalize content to digits only (strip non-digits)
+                                        txt = (hist_msg.content or "").strip()
+                                        # match single int content or content that starts with number
+                                        m2 = NUMBER_RE.search(txt)
+                                        if m2:
+                                            try:
+                                                val = int(m2.group(1))
+                                            except Exception:
+                                                continue
+                                            if val == last + 1:
+                                                accepted = True
+                                                break
+                            except Exception:
+                                logger.exception("Failed to scan history for bot prompt fallback")
+
+                if accepted:
+                    # valid count: update DB to the user's number
                     await bot.db.execute("UPDATE counting SET last_number = ? WHERE channel_id = ?", (number, message.channel.id))
                     await bot.db.commit()
 
@@ -774,6 +821,11 @@ async def on_message(message: discord.Message):
                     except Exception:
                         logger.exception("Failed to react ✅")
 
+                    # clear pending prompt if we've moved past it
+                    pend = bot.pending_prompts.get(message.channel.id)
+                    if pend and number >= pend.get("prompt_num", 0):
+                        bot.pending_prompts.pop(message.channel.id, None)
+
                     # send a bot prompt for the next number (do NOT write that into DB)
                     next_num = number + 1
                     try:
@@ -782,6 +834,11 @@ async def on_message(message: discord.Message):
                             await bot_msg.add_reaction("✅")
                         except Exception:
                             logger.exception("Failed to react to bot prompt")
+                        # record pending prompt in-memory
+                        try:
+                            await _set_pending_prompt(message.channel.id, next_num - 0, bot_msg.id)
+                        except Exception:
+                            logger.exception("Failed to set pending prompt")
                     except Exception:
                         logger.exception("Failed to send next number prompt")
                 else:
