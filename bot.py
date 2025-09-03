@@ -74,11 +74,15 @@ class TonyBot(commands.Bot):
         self.giveaways: Dict[int, dict] = {}
         # locks per counting channel to prevent race conditions
         self.count_locks: Dict[int, asyncio.Lock] = {}
+        # guard for creating locks
+        self._locks_registry_lock = asyncio.Lock()
 
     async def setup_hook(self):
         # create session & DB, ensure tables, register commands
         self.session = aiohttp.ClientSession()
         self.db = await aiosqlite.connect(DB_PATH)
+        # ensure rows are returned as tuples
+        self.db.row_factory = aiosqlite.Row
         await self._ensure_tables()
 
         # register giveaway group before syncing
@@ -189,6 +193,7 @@ def calculate_entries_for_member(member: discord.Member, gw_extra: Dict[int, int
 
 # -------------------------
 # UI: Join button + Participants dropdown (button-only joins)
+# (unchanged from previous working version)
 # -------------------------
 class JoinButton(discord.ui.Button):
     def __init__(self, message_id: int, initial_count: int = 0):
@@ -314,6 +319,7 @@ class ParticipantsView(discord.ui.View):
 
 # -------------------------
 # GIVEAWAY GROUP
+# (unchanged)
 # -------------------------
 giveaway_group = app_commands.Group(name="giveaway", description="Giveaway commands (button-based)")
 
@@ -605,6 +611,7 @@ async def giveaway_reroll(interaction: discord.Interaction, message_id: str):
 
 # -------------------------
 # Other commands (profile, report, suggest, help)
+# (unchanged)
 # -------------------------
 ROBLOX_USERS = "https://users.roblox.com/v1/usernames/users"
 
@@ -700,9 +707,10 @@ async def help_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # -------------------------
-# COUNTING GAME
+# COUNTING GAME (fixed & atomic)
 # -------------------------
-NUMBER_RE = re.compile(r"\d+")
+# match first sequence of digits anywhere
+NUMBER_RE = re.compile(r"(?<!\d)(\d+)(?!\d)")
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -718,18 +726,16 @@ async def on_message(message: discord.Message):
             await bot.process_commands(message)
             return
 
-        # parse the integer
+        # parse the integer (first match)
         try:
-            number = int(m.group())
+            number = int(m.group(1))
         except Exception:
-            # if something weird happens, skip counting but process commands
             await bot.process_commands(message)
             return
 
         # easter egg: if number is 67, reply to the user's message with the gif
         try:
             if number == 67:
-                # reply to that message with the gif URL (Discord will unfurl the tenor link)
                 try:
                     await message.reply(EASTER_EGG_67_GIF)
                 except Exception:
@@ -737,25 +743,28 @@ async def on_message(message: discord.Message):
         except Exception:
             logger.exception("Easter egg handling failed")
 
-        # get or create a lock for this channel to avoid race conditions
-        lock = bot.count_locks.get(message.channel.id)
-        if lock is None:
-            lock = asyncio.Lock()
-            bot.count_locks[message.channel.id] = lock
+        # ensure we have a lock for this channel (guard creation)
+        async with bot._locks_registry_lock:
+            if message.channel.id not in bot.count_locks:
+                bot.count_locks[message.channel.id] = asyncio.Lock()
+            lock = bot.count_locks[message.channel.id]
 
+        # critical section per-channel
         async with lock:
             try:
+                # start an immediate transaction to lock row for this channel
+                await bot.db.execute("BEGIN IMMEDIATE")
                 # ensure row exists
                 await bot.db.execute("INSERT OR IGNORE INTO counting (channel_id, last_number) VALUES (?, ?)", (message.channel.id, 0))
-                await bot.db.commit()
-
+                # read last_number
                 async with bot.db.execute("SELECT last_number FROM counting WHERE channel_id = ?", (message.channel.id,)) as cur:
                     row = await cur.fetchone()
-                    last = row[0] if row else 0
+                    last = int(row["last_number"]) if row and "last_number" in row.keys() else (row[0] if row else 0)
 
-                # VALID: message number must be exactly last+1
+                logger.debug("Channel %s last_number=%s incoming=%s", message.channel.id, last, number)
+
                 if number == last + 1:
-                    # update DB to reflect the last valid user number (do NOT set to the bot's prompt number)
+                    # valid hit: store the user's number
                     await bot.db.execute("UPDATE counting SET last_number = ? WHERE channel_id = ?", (number, message.channel.id))
                     await bot.db.commit()
 
@@ -765,7 +774,7 @@ async def on_message(message: discord.Message):
                     except Exception:
                         logger.exception("Failed to react ✅")
 
-                    # send the next number as a prompt (bot posts next_num) but we DO NOT store it as last_number
+                    # send a bot prompt for the next number (do NOT write that into DB)
                     next_num = number + 1
                     try:
                         bot_msg = await message.channel.send(str(next_num))
@@ -795,12 +804,16 @@ async def on_message(message: discord.Message):
                         except Exception:
                             logger.exception("Failed to add failure role")
             except Exception:
-                logger.exception("Counting logic failed")
-                # fallback: process commands if any
+                logger.exception("Counting logic failed (in transaction)")
+                try:
+                    await bot.db.rollback()
+                except Exception:
+                    logger.exception("Rollback failed")
+                # let commands run to avoid dead path
                 await bot.process_commands(message)
                 return
 
-        # don't run normal command processing twice (we already handled it)
+        # we handled counting; do not process commands again
         return
 
     # react if bot mentioned
